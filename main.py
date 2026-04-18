@@ -18,9 +18,9 @@ def send(msg):
     if WEBHOOK:
         try:
             requests.post(WEBHOOK, json={"content": msg})
-            print(f"✅ Alert sent")
+            print("Alert sent")
         except Exception as e:
-            print(f"❌ Discord Error: {e}")
+            print(f"Discord Error: {e}")
 
 def check(addr):
     try:
@@ -33,30 +33,30 @@ def check(addr):
         return True, 0, 0
 
 # Startup message
-print("🚀 Bot Starting with TIGHTER filters...")
-send("🚀 **Bot Updated!** Stricter filters active:\n💧 Liq: $50k+\n📊 Vol: $30k+\n📈 Change: 8%+\n⏰ Age: 24h+")
+print("Bot Starting with TIGHTER filters...")
+send("Bot Updated! Stricter filters active:\nLiq: $50k+\nVol: $30k+\nChange: 8%+\nAge: 24h+")
 time.sleep(2)
 
 while True:
     try:
-        print(f"\n🔍 Scanning... Active filters: Liq $50k+, Vol $30k+, Change 8%+")
+        print(f"\nScanning... Active filters: Liq $50k+, Vol $30k+, Change 8%+")
 
         for chain in [{"n": "BSC", "q": "bsc"}, {"n": "SOL", "q": "solana"}]:
             try:
                 resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['q']}", timeout=10)
 
                 if resp.status_code != 200:
-                    print(f"⚠️ {chain['n']} API error: {resp.status_code}")
+                    print(f"{chain['n']} API error: {resp.status_code}")
                     continue                
                 pairs = resp.json().get("pairs", [])
 
                 if not pairs:
-                    print(f"⚠️ No pairs for {chain['n']}")
+                    print(f"No pairs for {chain['n']}")
                     continue
 
-                print(f"✅ {chain['n']}: Checking {len(pairs[:10])} pairs...")
+                print(f"{chain['n']}: Checking {len(pairs[:10])} pairs...")
 
-                for p in pairs[:10]:  # Check top 10 instead of 5
+                for p in pairs[:10]:
                     addr = p.get("baseToken", {}).get("address")
                     sym = p.get("baseToken", {}).get("symbol", "?")
                     price = p.get("priceUsd")
@@ -71,21 +71,21 @@ while True:
                     mcap = float(p.get("marketCap", 0))
 
                     # TIGHTER FILTERS
-                    if liq < 50000:  # Increased from $20k to $50k
+                    if liq < 50000:
                         continue
-                    if vol < 30000:  # Increased from $15k to $30k
+                    if vol < 30000:
                         continue
-                    if chg < 8:  # Increased from 5% to 8%
+                    if chg < 8:
                         continue
-                    if mcap < 50000:  # NEW: Min $50k market cap
+                    if mcap < 50000:
                         continue
 
-                    # Check token age (if available)
+                    # Check token age
                     pair_created_at = p.get("pairCreatedAt")
                     if pair_created_at:
                         token_age_hours = (datetime.now().timestamp() * 1000 - pair_created_at) / (1000 * 60 * 60)
-                        if token_age_hours < 24:  # NEW: Token must be at least 24h old
-                            print(f"⏰ {sym}: Too new ({token_age_hours:.1f}h), skipping")
+                        if token_age_hours < 24:
+                            print(f"{sym}: Too new ({token_age_hours:.1f}h), skipping")
                             continue
 
                     # Check cooldown
@@ -96,28 +96,28 @@ while True:
                     # Security check
                     safe, bt, st = check(addr)
                     if not safe or bt > 5 or st > 5:
-                        print(f"🛡️ {sym}: Failed security check")                        continue
+                        print(f"SECURITY FAIL: {sym}")                        continue
 
                     # Send alert
                     recent[addr] = now
-                    msg = (f"🚨 **HIGH-QUALITY** [{chain['n']}] ${sym}\n"
-                           f"💰 ${price} | +{chg}%\n"
-                           f"💧 ${liq:,.0f} | Vol ${vol:,.0f}\n"
-                           f"📊 MC ${mcap:,.0f}\n"
-                           f"🛡️ Tax: {bt}%/{st}%\n"
-                           f"🔗 https://dexscreener.com/{chain['q']}/{addr}")
+                    msg = (f"HIGH-QUALITY [{chain['n']}] ${sym}\n"
+                           f"Price: ${price} | +{chg}%\n"
+                           f"Liq: ${liq:,.0f} | Vol ${vol:,.0f}\n"
+                           f"MC: ${mcap:,.0f}\n"
+                           f"Tax: {bt}%/{st}%\n"
+                           f"https://dexscreener.com/{chain['q']}/{addr}")
 
                     send(msg)
-                    print(f"✅ ALERT SENT: {sym} (Liq: ${liq:,.0f}, Vol: ${vol:,.0f}, +{chg}%)")
+                    print(f"ALERT SENT: {sym}")
                     time.sleep(2)
 
             except Exception as e:
-                print(f"⚠️ {chain['n']} scan error: {e}")
+                print(f"{chain['n']} scan error: {e}")
                 continue
 
-        print("⏳ Waiting 60 seconds before next scan...\n")
+        print("Waiting 60 seconds...\n")
         time.sleep(60)
 
     except Exception as e:
-        print(f"💥 Critical Error: {e}")
+        print(f"Critical Error: {e}")
         time.sleep(60)
