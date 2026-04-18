@@ -1,4 +1,6 @@
-import os, time, requests
+import os
+import time
+import requests
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -10,9 +12,12 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "✅ Bot is Running! Filters: Liq $50k+, Vol $30k+, Change 8%+, Age 24h+"
+    return "Bot Running"
 
-Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+Thread(target=run_flask).start()
 
 def send(msg):
     if WEBHOOK:
@@ -20,57 +25,58 @@ def send(msg):
             requests.post(WEBHOOK, json={"content": msg})
             print("Alert sent")
         except Exception as e:
-            print(f"Discord Error: {e}")
+            print("Discord Error: " + str(e))
 
-def check(addr):
+def check_security(addr):
     try:
-        r = requests.get(f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={addr}", timeout=5)
+        r = requests.get("https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses=" + addr, timeout=5)
         if r.status_code != 200:
             return True, 0, 0
         d = r.json().get("result", {}).get(addr.lower(), {})
-        return d.get("is_honeypot", "1") == "0", float(d.get("buy_tax", 0)), float(d.get("sell_tax", 0))
+        is_safe = d.get("is_honeypot", "1") == "0"
+        buy_tax = float(d.get("buy_tax", 0))
+        sell_tax = float(d.get("sell_tax", 0))
+        return is_safe, buy_tax, sell_tax
     except:
         return True, 0, 0
 
-# Startup message
-print("Bot Starting with TIGHTER filters...")
-send("Bot Updated! Stricter filters active:\nLiq: $50k+\nVol: $30k+\nChange: 8%+\nAge: 24h+")
+print("Bot starting...")
+send("Bot Updated - Filters Active")
 time.sleep(2)
 
 while True:
     try:
-        print(f"\nScanning... Active filters: Liq $50k+, Vol $30k+, Change 8%+")
-
-        for chain in [{"n": "BSC", "q": "bsc"}, {"n": "SOL", "q": "solana"}]:
+        print("Scanning...")
+        chains = [            {"name": "BSC", "query": "bsc"},
+            {"name": "SOL", "query": "solana"}
+        ]
+        
+        for chain in chains:
             try:
-                resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['q']}", timeout=10)
-
+                url = "https://api.dexscreener.com/latest/dex/search?q=" + chain["query"]
+                resp = requests.get(url, timeout=10)
+                
                 if resp.status_code != 200:
-                    print(f"{chain['n']} API error: {resp.status_code}")
-                    continue                
-                pairs = resp.json().get("pairs", [])
-
-                if not pairs:
-                    print(f"No pairs for {chain['n']}")
                     continue
-
-                print(f"{chain['n']}: Checking {len(pairs[:10])} pairs...")
-
+                
+                pairs = resp.json().get("pairs", [])
+                if not pairs:
+                    continue
+                
                 for p in pairs[:10]:
-                    addr = p.get("baseToken", {}).get("address")
-                    sym = p.get("baseToken", {}).get("symbol", "?")
+                    token = p.get("baseToken", {})
+                    addr = token.get("address")
+                    sym = token.get("symbol", "?")
                     price = p.get("priceUsd")
-
+                    
                     if not addr or not price:
                         continue
-
-                    # Get metrics
+                    
                     liq = float(p.get("liquidity", {}).get("usd", 0))
                     vol = float(p.get("volume", {}).get("h24", 0))
                     chg = float(p.get("priceChange", {}).get("m5", 0))
                     mcap = float(p.get("marketCap", 0))
-
-                    # TIGHTER FILTERS
+                    
                     if liq < 50000:
                         continue
                     if vol < 30000:
@@ -79,45 +85,39 @@ while True:
                         continue
                     if mcap < 50000:
                         continue
-
-                    # Check token age
-                    pair_created_at = p.get("pairCreatedAt")
-                    if pair_created_at:
-                        token_age_hours = (datetime.now().timestamp() * 1000 - pair_created_at) / (1000 * 60 * 60)
-                        if token_age_hours < 24:
-                            print(f"{sym}: Too new ({token_age_hours:.1f}h), skipping")
+                    
+                    created = p.get("pairCreatedAt")
+                    if created:
+                        age_ms = datetime.now().timestamp() * 1000 - created
+                        age_hours = age_ms / (1000 * 60 * 60)
+                        if age_hours < 24:
                             continue
-
-                    # Check cooldown
+                    
                     now = datetime.now()
-                    if addr in recent and (now - recent[addr]) < timedelta(minutes=30):
+                    if addr in recent and (now - recent[addr]).seconds < 1800:
                         continue
-
-                    # Security check
-                    safe, bt, st = check(addr)
+                    safe, bt, st = check_security(addr)
                     if not safe or bt > 5 or st > 5:
-                        print(f"SECURITY FAIL: {sym}")                        continue
-
-                    # Send alert
+                        continue
+                    
                     recent[addr] = now
-                    msg = (f"HIGH-QUALITY [{chain['n']}] ${sym}\n"
-                           f"Price: ${price} | +{chg}%\n"
-                           f"Liq: ${liq:,.0f} | Vol ${vol:,.0f}\n"
-                           f"MC: ${mcap:,.0f}\n"
-                           f"Tax: {bt}%/{st}%\n"
-                           f"https://dexscreener.com/{chain['q']}/{addr}")
-
-                    send(msg)
-                    print(f"ALERT SENT: {sym}")
+                    
+                    alert_msg = "ALERT [" + chain["name"] + "] $" + sym + "\n"
+                    alert_msg += "Price: $" + str(price) + " | +" + str(chg) + "%\n"
+                    alert_msg += "Liq: $" + str(int(liq)) + " | Vol: $" + str(int(vol)) + "\n"
+                    alert_msg += "https://dexscreener.com/" + chain["query"] + "/" + addr
+                    
+                    send(alert_msg)
+                    print("Sent: " + sym)
                     time.sleep(2)
-
+                    
             except Exception as e:
-                print(f"{chain['n']} scan error: {e}")
+                print("Error: " + str(e))
                 continue
-
-        print("Waiting 60 seconds...\n")
+        
+        print("Waiting 60s...")
         time.sleep(60)
-
+        
     except Exception as e:
-        print(f"Critical Error: {e}")
+        print("Main error: " + str(e))
         time.sleep(60)
