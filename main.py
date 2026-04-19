@@ -47,7 +47,8 @@ def simulate_trade(symbol, price, amount_usd, side):
     gas = 0.25
     if side == "buy":
         fill = price * (1 + slippage / 100)
-        total = amount_usd + gas    else:
+        total = amount_usd + gas
+    else:
         fill = price * (1 - slippage / 100)
         total = gas
     return {"success": True, "side": side, "symbol": symbol, "requested": amount_usd,
@@ -194,7 +195,8 @@ while True:
                         print("Daily loss limit hit - pausing")
                         time.sleep(300)
                         break
-                    if len(active_trades) >= MAX_POSITIONS:                        print("Max positions reached")
+                    if len(active_trades) >= MAX_POSITIONS:
+                        print("Max positions reached")
                         break
                     
                     trade_amt = min(MAX_TRADE_SIZE, liq * 0.01)
