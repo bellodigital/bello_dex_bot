@@ -7,9 +7,9 @@ from threading import Thread
 
 # === CONFIGURATION ===
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
-                       # Accepts: true, True, TRUE, 1, yes, Yes (case-insensitive)
-                       paper_env = os.getenv("PAPER_MODE", "True").lower().strip()
-                       PAPER_MODE = paper_env in ["true", "1", "yes", "y"] "True").lower() == "true"
+# Accepts: true, True, TRUE, 1, yes, Yes (case-insensitive)
+paper_env = os.getenv("PAPER_MODE", "True").lower().strip()
+PAPER_MODE = paper_env in ["true", "1", "yes", "y"]
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "2.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-10"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "20"))
