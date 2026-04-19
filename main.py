@@ -96,7 +96,8 @@ def check_security(addr):
         r = requests.get(url, timeout=5)
         if r.status_code != 200:
             return True, 0, 0, True
-        data = r.json()        result = data.get("result", {})
+        data = r.json()
+        result = data.get("result", {})
         token = result.get(addr.lower(), {})
         
         is_honeypot = token.get("is_honeypot", "1") == "0"
@@ -145,7 +146,7 @@ while True:
             print("Daily P&L reset")
         
         print(f"\n🔍 Scanning BSC... (P&L today: ${daily_pnl:.2f})")
-                chain = {"name": "BSC", "query": "bsc", "id": "56"}
+        chain = {"name": "BSC", "query": "bsc", "id": "56"}
         
         try:
             # Fetch pairs from DexScreener
@@ -292,7 +293,8 @@ while True:
                 time.sleep(2)  # Avoid rate limits
                 
         except Exception as e:
-            print("BSC scan error: " + str(e))            continue
+            print("BSC scan error: " + str(e))
+            continue
         
         print("⏳ Waiting 60 seconds...\n")
         time.sleep(60)
