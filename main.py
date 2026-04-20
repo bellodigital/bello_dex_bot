@@ -145,7 +145,8 @@ while True:
                 print(f"→ Scanning {chain['name']}...")
                 resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['query']}", timeout=10)
                 
-                if resp.status_code != 200:                    print(f"⚠️ {chain['name']} API error")
+                if resp.status_code != 200:
+                    print(f"⚠️ {chain['name']} API error")
                     time.sleep(5)
                     continue
                 
