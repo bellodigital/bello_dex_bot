@@ -5,28 +5,32 @@ from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
 
-# === CONFIGURATION ===
+# === CONFIGURATION (Set in Railway Variables or use defaults) ===
+# SECURITY: Defaults to PAPER MODE unless explicitly set to 'false'
+paper_env = os.getenv("PAPER_MODE", "true").lower().strip()
+PAPER_MODE = paper_env not in ["false", "0", "no"]
+
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
-# Accepts: true, True, TRUE, 1, yes, Yes (case-insensitive)
-paper_env = os.getenv("PAPER_MODE", "True").lower().strip()
-PAPER_MODE = paper_env in ["true", "1", "yes", "y"]
-MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "2.0"))
+
+# FILTERS (Relaxed for better signal frequency on Mondays)
+MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "1.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-10"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "20"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-5"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "30000"))
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "8"))
-MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "24"))
+
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "30000"))   # Relaxed from 50k
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "20000"))       # Relaxed from 30k
+MIN_CHANGE = float(os.getenv("MIN_CHANGE", "6"))           # Relaxed from 8%
+MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "12"))    # Relaxed from 24h
 
 # === GLOBAL STATE ===
-recent = {}
-active_trades = {}
+recent = {}          # Cooldown tracker
+active_trades = {}   # Open paper positions: {addr: {entry, amount, quantity, chain, ts}}
 daily_pnl = 0.0
 last_reset = datetime.now().date()
 
-# === FLASK SERVER ===
+# === FLASK UPTIME SERVER ===
 app = Flask('')
 @app.route('/')
 def home():
@@ -35,7 +39,7 @@ def home():
 
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
-# === HELPERS ===
+# === HELPER FUNCTIONS ===
 def send(msg):
     if WEBHOOK:
         try:
@@ -43,21 +47,25 @@ def send(msg):
             print("Discord: " + msg[:60] + "...")
         except Exception as e:
             print("Discord Error: " + str(e))
-
 def simulate_trade(symbol, price, amount_usd, side):
+    """Simulates realistic slippage and gas costs"""
+    # Slippage: 0.5% base + 0.1% per $1000 trade size
     slippage = 0.5 + (amount_usd / 1000) * 0.1
-    gas = 0.25
+    gas = 0.25  # Estimated BSC gas
+    
     if side == "buy":
         fill = price * (1 + slippage / 100)
         total = amount_usd + gas
     else:
         fill = price * (1 - slippage / 100)
         total = gas
+        
     return {"success": True, "side": side, "symbol": symbol, "requested": amount_usd,
             "fill_price": round(fill, 8), "slippage_pct": round(slippage, 2),
             "gas_cost": gas, "total_cost": round(total, 2)}
 
 def check_security(chain_id, addr):
+    """GoPlus Security Check - FAILS SAFE (Returns False if API error)"""
     try:
         if chain_id == "solana":
             url = "https://api.gopluslabs.io/api/v1/solana/token_security"
@@ -67,32 +75,44 @@ def check_security(chain_id, addr):
             params = {"contract_addresses": addr}
         
         r = requests.get(url, params=params, timeout=5)
-        if r.status_code != 200: return True, 0, 0
+        if r.status_code != 200:
+            # API Error -> Assume UNSAFE
+            return False, 99, 99
+        
         data = r.json()
         token = data.get("result", {}).get(addr.lower(), {})
         
+        # If no data found for this address, assume unsafe
+        if not token:
+            return False, 99, 99
+            
         is_honeypot = token.get("is_honeypot", "1") == "0"
         buy_tax = float(token.get("buy_tax", 0) or 0)
         sell_tax = float(token.get("sell_tax", 0) or 0)
+        
         return is_honeypot, buy_tax, sell_tax
-    except:
-        return True, 0, 0
-
+        
+    except Exception as e:
+        # Network/Code Error -> Assume UNSAFE
+        print(f"Security Check Failed for {addr}: {e}")
+        return False, 99, 99
 def calculate_score(liq, vol, chg, is_safe):
+    """Simple 0-100 Signal Score"""
     score = 0
     if liq >= 100000: score += 25
     elif liq >= 50000: score += 15
-    if vol / max(liq, 1) > 1: score += 20
+    if vol / max(liq, 1) > 1: score += 20  # Volume > Liquidity
     if chg >= 10: score += 25
-    elif chg >= 8: score += 15
+    elif chg >= 6: score += 15
     if is_safe: score += 20
+    
     risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
     return min(100, score), risk
 
 # === STARTUP ===
 print("Auto-Trading Bot starting...")
 mode_tag = "🧪 PAPER MODE" if PAPER_MODE else "💰 LIVE MODE"
-send(f"🤖 {mode_tag} Started\n🎯 Trading: BSC Only\n👀 Watching: Solana (alerts only)\nMax: ${MAX_TRADE_SIZE} | SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}%")
+send(f"🤖 {mode_tag} Started\n🎯 Trading: BSC Only\n👀 Watching: Solana (alerts only)\nFilters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, Chg>{MIN_CHANGE}%\nMax: ${MAX_TRADE_SIZE} | SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}%")
 time.sleep(2)
 
 # === CHAINS CONFIG ===
@@ -100,23 +120,32 @@ chains = [
     {"name": "BSC", "query": "bsc", "id": "56", "trade": True},   # ✅ Will trade
     {"name": "SOL", "query": "solana", "id": "solana", "trade": False}  # 👀 Alerts only
 ]
+
 # === MAIN LOOP ===
 while True:
     try:
+        # 1. Daily Reset & Memory Cleanup
         today = datetime.now().date()
         if today != last_reset:
             daily_pnl = 0.0
             last_reset = today
             print("Daily P&L reset")
         
+        # Cleanup old entries from 'recent' dict (older than 1 hour)
+        now_clean = datetime.now()
+        keys_to_delete = [addr for addr, ts in recent.items() if (now_clean - ts).seconds > 3600]
+        for key in keys_to_delete:
+            del recent[key]
+            
         print(f"\n🔍 Scanning... (P&L: ${daily_pnl:.2f} | Positions: {len(active_trades)}/{MAX_POSITIONS})")
         
+        # 2. Scan Chains
         for chain in chains:
             try:
                 print(f"→ Scanning {chain['name']}...")
                 resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['query']}", timeout=10)
-                if resp.status_code != 200:
-                    print(f"⚠️ {chain['name']} API error")
+                
+                if resp.status_code != 200:                    print(f"⚠️ {chain['name']} API error")
                     time.sleep(5)
                     continue
                 
@@ -130,6 +159,7 @@ while True:
                     addr = base.get("address")
                     sym = base.get("symbol", "?")
                     price = p.get("priceUsd")
+                    
                     if not addr or not price: continue
                     
                     liq = float(p.get("liquidity", {}).get("usd", 0))
@@ -141,14 +171,18 @@ while True:
                     if liq < MIN_LIQUIDITY or vol < MIN_VOLUME or chg < MIN_CHANGE or mcap < 50000:
                         continue
                     
+                    # Age Check
                     created = p.get("pairCreatedAt")
                     if created:
                         age_h = (datetime.now().timestamp() * 1000 - created) / (1000 * 60 * 60)
                         if age_h < MIN_AGE_HOURS: continue
                     
+                    # Cooldown Check
                     now = datetime.now()
                     if addr in recent and (now - recent[addr]).seconds < 1800:
-                        continue                    
+                        continue
+                    
+                    # Security Check (FAILS SAFE)
                     is_safe, buy_tax, sell_tax = check_security(chain["id"], addr)
                     if not is_safe or buy_tax > 5 or sell_tax > 5:
                         continue
@@ -156,12 +190,11 @@ while True:
                     score, risk = calculate_score(liq, vol, chg, is_safe)
                     risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(risk, "⚪")
                     
-                    # === SOLOANA: INFO ALERT ONLY ===
+                    # === SOLANA: INFO ALERT ONLY ===
                     if not chain["trade"]:
                         info_msg = (f"👀 {risk_emoji} SOLANA OPPORTUNITY [{chain['name']}] ${sym}\n"
                                    f"Score: {score}/100 | Price: ${float(price):.8f}\n"
-                                   f"Liq: ${liq:,.0f} | Vol: ${vol:,.0f} | +{chg}%\n"
-                                   f"Tax: {buy_tax}%/{sell_tax}%\n"
+                                   f"Liq: ${liq:,.0f} | Vol: ${vol:,.0f} | +{chg}%\n"                                   f"Tax: {buy_tax}%/{sell_tax}%\n"
                                    f"⚠️ Info only - BSC trading enabled\n"
                                    f"https://dexscreener.com/{chain['query']}/{addr}")
                         send(info_msg)
@@ -173,6 +206,7 @@ while True:
                         entry = active_trades[addr]["entry_price"]
                         pnl_pct = ((float(price) - entry) / entry) * 100
                         
+                        # Stop-Loss
                         if pnl_pct <= STOP_LOSS_PCT:
                             pnl_usd = (float(price) - entry) * active_trades[addr]["quantity"]
                             daily_pnl += pnl_usd
@@ -181,6 +215,8 @@ while True:
                             del active_trades[addr]
                             recent[addr] = now
                             continue
+                        
+                        # Take-Profit
                         elif pnl_pct >= TAKE_PROFIT_PCT:
                             pnl_usd = (float(price) - entry) * active_trades[addr]["quantity"]
                             daily_pnl += pnl_usd
@@ -189,29 +225,35 @@ while True:
                             del active_trades[addr]
                             recent[addr] = now
                             continue
+                        
+                        # Still Holding
                         else:
                             continue
                     
-                    # === RISK CHECKS ===
+                    # === RISK CHECKS FOR NEW TRADE ===
                     if daily_pnl <= DAILY_LOSS_LIMIT:
                         print("Daily loss limit hit - pausing")
                         time.sleep(300)
                         break
+                    
                     if len(active_trades) >= MAX_POSITIONS:
                         print("Max positions reached")
                         break
                     
+                    # Position Sizing
                     trade_amt = min(MAX_TRADE_SIZE, liq * 0.01)
                     if trade_amt < 1: continue
-                    
+                                        # Simulate Buy
                     result = simulate_trade(sym, float(price), trade_amt, "buy")
                     if not result["success"]: continue
                     
+                    # Record Trade
                     qty = trade_amt / result["fill_price"]
                     active_trades[addr] = {"entry_price": result["fill_price"], "amount": trade_amt, 
                                           "quantity": qty, "chain": "BSC", "ts": now}
                     recent[addr] = now
                     
+                    # Send Alert
                     mode_lbl = "🧪 PAPER" if PAPER_MODE else "💰 LIVE"
                     alert = (f"{mode_lbl} {risk_emoji} BUY [BSC] ${sym}\n"
                              f"Score: {score}/100 | Entry: ${result['fill_price']:.8f}\n"
