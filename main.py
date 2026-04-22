@@ -47,7 +47,8 @@ def send(msg):
         except Exception as e:
             print("Discord Error:", e)
 
-def simulate_trade(symbol, price, amount_usd, side):    slippage = 0.5 + (amount_usd / 1000) * 0.1
+def simulate_trade(symbol, price, amount_usd, side):
+    slippage = 0.5 + (amount_usd / 1000) * 0.1
     gas = 0.25
     fill = price * (1 + slippage/100) if side == "buy" else price * (1 - slippage/100)
     return {
@@ -194,7 +195,8 @@ while True:
                     if not is_safe: continue
                     if buy_tax > 5 or sell_tax > 5: continue
 
-                    score, risk = calculate_score(liq, vol, chg, is_safe)                    risk_label  = {"low":"[LOW]", "medium":"[MED]", "high":"[HIGH]"}.get(risk, "[?]")
+                    score, risk = calculate_score(liq, vol, chg, is_safe)
+                    risk_label  = {"low":"[LOW]", "medium":"[MED]", "high":"[HIGH]"}.get(risk, "[?]")
 
                     # === SOL: ALERT ONLY ===
                     if not chain["trade"]:
