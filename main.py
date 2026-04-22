@@ -16,7 +16,7 @@ TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT",  "20"))
 MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-5"))
 
-# RELAXED FILTERS FOR FRESH LAUNCHES
+# RELAXED FILTERS FOR BETTER SIGNAL FLOW
 MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "20000"))
 MIN_VOLUME       = float(os.getenv("MIN_VOLUME",       "10000"))
 MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "3"))
@@ -34,9 +34,7 @@ app = Flask('')
 @app.route('/')
 def home():
     mode = "PAPER" if PAPER_MODE else "LIVE"
-    return (f"NexusBot {mode} | "
-            f"P&L: ${daily_pnl:.2f} | "
-            f"Positions: {len(active_trades)}/{MAX_POSITIONS}")
+    return f"NexusBot {mode} | P&L: ${daily_pnl:.2f} | Positions: {len(active_trades)}/{MAX_POSITIONS}"
 
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
@@ -48,8 +46,8 @@ def send(msg):
             print("Discord:", msg[:80])
         except Exception as e:
             print("Discord Error:", e)
-def simulate_trade(symbol, price, amount_usd, side):
-    slippage = 0.5 + (amount_usd / 1000) * 0.1
+
+def simulate_trade(symbol, price, amount_usd, side):    slippage = 0.5 + (amount_usd / 1000) * 0.1
     gas = 0.25
     fill = price * (1 + slippage/100) if side == "buy" else price * (1 - slippage/100)
     return {
@@ -89,43 +87,31 @@ def check_security(chain_id, addr):
     except Exception as e:
         print(f"Security check failed for {addr}: {e}")
         return False, 99, 99
-    def calculate_score(liq, vol, chg, is_safe):
-        score = 0
-        if liq >= 100000: 
-            score += 25
-        elif liq >= 50000: 
-            score += 15
 
-        if vol / max(liq, 1) > 1: 
-            score += 20
+def calculate_score(liq, vol, chg, is_safe):
+    score = 0
+    if liq >= 100000: 
+        score += 25
+    elif liq >= 50000: 
+        score += 15
+        
+    if vol / max(liq, 1) > 1: 
+        score += 20        
+    if chg >= 10: 
+        score += 25
+    elif chg >= 3: 
+        score += 15
+        
+    if is_safe: 
+        score += 20
+        
+    risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
+    return min(100, score), risk
 
-        if chg >= 10: 
-            score += 25
-        elif chg >= 3: 
-            score += 15
-
-        if is_safe: 
-            score += 20
-
-        risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
-        return min(100, score), risk
-
-# FIX: Use new-pairs endpoint for fresh launches
+# === CHAINS CONFIG (Using Reliable Search Endpoint) ===
 CHAINS = [
-    {
-        "name": "BSC",
-        "url": "https://api.dexscreener.com/latest/dex/pairs/bsc",
-        "id": "56",
-        "ds_path": "bsc",
-        "trade": True
-    },
-    {
-        "name": "SOL",
-        "url": "https://api.dexscreener.com/latest/dex/pairs/solana",
-        "id": "solana",
-        "ds_path": "solana",
-        "trade": False
-    },
+    {"name": "BSC", "query": "bsc", "id": "56", "trade": True},
+    {"name": "SOL", "query": "solana", "id": "solana", "trade": False}
 ]
 
 # === STARTUP ===
@@ -155,14 +141,15 @@ while True:
             addr for addr, ts in recent.items()
             if (now_clean - ts).total_seconds() > 3600
         ]
-        for key in keys_to_delete:            del recent[key]
+        for key in keys_to_delete:
+            del recent[key]
 
         print(f"\nScanning... (P&L: ${daily_pnl:.2f} | Positions: {len(active_trades)}/{MAX_POSITIONS})")
-
         for chain in CHAINS:
             try:
                 print(f"Scanning {chain['name']}...")
-                resp = requests.get(chain["url"], timeout=10)
+                # Using the reliable search endpoint
+                resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['query']}", timeout=10)
 
                 if resp.status_code != 200:
                     print(f"{chain['name']} API error {resp.status_code}")
@@ -190,35 +177,27 @@ while True:
                     chg  = float((p.get("priceChange") or {}).get("m5", 0))
                     mcap = float(p.get("marketCap") or 0)
 
-                    # === FILTERS with debug logging ===
-                    if liq < MIN_LIQUIDITY:
-                        continue
-                    if vol < MIN_VOLUME:
-                        continue
-                    if chg < MIN_CHANGE:
-                        continue
-                    if mcap > 0 and mcap < 50000:
-                        continue
+                    # === FILTERS ===
+                    if liq < MIN_LIQUIDITY: continue
+                    if vol < MIN_VOLUME: continue
+                    if chg < MIN_CHANGE: continue
+                    if mcap > 0 and mcap < 50000: continue
 
                     # Age check
                     created = p.get("pairCreatedAt")
                     if created:
                         age_h = (datetime.now().timestamp() * 1000 - created) / (1000 * 60 * 60)
-                        if age_h < MIN_AGE_HOURS:                            continue
+                        if age_h < MIN_AGE_HOURS: continue
 
                     # Cooldown
                     now = datetime.now()
                     if addr in recent:
                         elapsed = (now - recent[addr]).total_seconds()
-                        if elapsed < 1800:
-                            continue
-
+                        if elapsed < 1800: continue
                     # Security check
                     is_safe, buy_tax, sell_tax = check_security(chain["id"], addr)
-                    if not is_safe:
-                        continue
-                    if buy_tax > 5 or sell_tax > 5:
-                        continue
+                    if not is_safe: continue
+                    if buy_tax > 5 or sell_tax > 5: continue
 
                     score, risk = calculate_score(liq, vol, chg, is_safe)
                     risk_label  = {"low":"[LOW]", "medium":"[MED]", "high":"[HIGH]"}.get(risk, "[?]")
@@ -230,7 +209,7 @@ while True:
                             f"Score: {score}/100 | Price: ${float(price):.8f}\n"
                             f"Liq: ${liq:,.0f} | Vol: ${vol:,.0f} | +{chg}%\n"
                             f"Tax: {buy_tax}%/{sell_tax}%\n"
-                            f"https://dexscreener.com/{chain['ds_path']}/{addr}"
+                            f"https://dexscreener.com/{chain['query']}/{addr}"
                         )
                         recent[addr] = now
                         continue
@@ -253,6 +232,7 @@ while True:
                             del active_trades[addr]
                             recent[addr] = now
                         continue
+
                     # === BSC: NEW TRADE ===
                     if daily_pnl <= DAILY_LOSS_LIMIT:
                         print("Daily loss limit hit - pausing 5min")
@@ -263,9 +243,7 @@ while True:
                         print("Max positions reached")
                         break
 
-                    trade_amt = min(MAX_TRADE_SIZE, liq * 0.01)
-                    if trade_amt < 0.1:
-                        continue
+                    trade_amt = min(MAX_TRADE_SIZE, liq * 0.01)                    if trade_amt < 0.1: continue
 
                     result = simulate_trade(sym, float(price), trade_amt, "buy")
                     qty    = trade_amt / result["fill_price"]
