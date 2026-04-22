@@ -89,16 +89,26 @@ def check_security(chain_id, addr):
     except Exception as e:
         print(f"Security check failed for {addr}: {e}")
         return False, 99, 99
+    def calculate_score(liq, vol, chg, is_safe):
+        score = 0
+        if liq >= 100000: 
+            score += 25
+        elif liq >= 50000: 
+            score += 15
 
-def calculate_score(liq, vol, chg, is_safe):
-    score = 0
-    if liq  >= 100000: score += 25
-    elif liq >= 50000: score += 15
-    if vol / max(liq, 1) > 1: score += 20
-    if chg  >= 10: score += 25
-    elif chg >= 3: score += 15    if is_safe: score += 20
-    risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
-    return min(100, score), risk
+        if vol / max(liq, 1) > 1: 
+            score += 20
+
+        if chg >= 10: 
+            score += 25
+        elif chg >= 3: 
+            score += 15
+
+        if is_safe: 
+            score += 20
+
+        risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
+        return min(100, score), risk
 
 # FIX: Use new-pairs endpoint for fresh launches
 CHAINS = [
