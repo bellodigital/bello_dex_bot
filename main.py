@@ -10,17 +10,17 @@ paper_env = os.getenv("PAPER_MODE", "true").lower().strip()
 PAPER_MODE = paper_env not in ["false", "0", "no"]
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 
-# FILTERS (Relaxed for New Pairs)
+# FILTERS (Optimized for Volatile Tokens)
 MAX_TRADE_SIZE   = float(os.getenv("MAX_TRADE_SIZE",   "1.0"))
 STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",    "-10"))
 TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT",  "20"))
 MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-5"))
 
-MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000")) # Lower for new pairs
+MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000"))
 MIN_VOLUME       = float(os.getenv("MIN_VOLUME",       "5000"))
-MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "1"))     # Catch small pumps
-MIN_AGE_HOURS    = float(os.getenv("MIN_AGE_HOURS",    "0"))     # Allow brand new
+MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "1"))
+MIN_AGE_HOURS    = float(os.getenv("MIN_AGE_HOURS",    "0"))
 
 # === STATE ===
 recent        = {}
@@ -34,7 +34,7 @@ app = Flask('')
 @app.route('/')
 def home():
     mode = "PAPER" if PAPER_MODE else "LIVE"
-    return f"NexusBot NEW PAIRS {mode} | P&L: ${daily_pnl:.2f} | Pos: {len(active_trades)}/{MAX_POSITIONS}"
+    return f"NexusBot VOLATILE {mode} | P&L: ${daily_pnl:.2f} | Pos: {len(active_trades)}/{MAX_POSITIONS}"
 
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
@@ -60,7 +60,6 @@ def simulate_trade(symbol, price, amount_usd, side):
     }
 
 def check_security(chain_id, addr):
-    """Returns (is_safe, buy_tax, sell_tax). Fails safe."""
     try:
         if chain_id == "solana":
             url = "https://api.gopluslabs.io/api/v1/solana/token_security"
@@ -96,18 +95,20 @@ def calculate_score(liq, vol, chg, is_safe):
     risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
     return min(100, score), risk
 
-# === CHAINS CONFIG (Using New Pairs Endpoint) ===
-CHAINS = [    {"name": "BSC", "url": "https://api.dexscreener.com/latest/dex/pairs/bsc", "id": "56", "trade": True},
-    {"name": "SOL", "url": "https://api.dexscreener.com/latest/dex/pairs/solana", "id": "solana", "trade": False}
+# === CHAINS & SEARCH TERMS ===
+# We search for 'meme' and 'ai' because these categories usually have high volatility
+SEARCH_TERMS = [    {"name": "BSC-MEME", "query": "meme", "id": "56", "trade": True},
+    {"name": "BSC-AI",   "query": "ai",   "id": "56", "trade": True},
+    {"name": "SOL-MEME", "query": "meme", "id": "solana", "trade": False},
 ]
 
 # === STARTUP ===
-print("NexusBot NEW PAIRS starting...")
+print("NexusBot VOLATILE starting...")
 mode_tag = "PAPER MODE" if PAPER_MODE else "LIVE MODE"
 send(
-    f"NexusBot [{mode_tag}] NEW PAIRS LOGIC\n"
+    f"NexusBot [{mode_tag}] VOLATILE SCANNER\n"
     f"Trading: BSC | Watching: SOL\n"
-    f"Strategy: Scan Fresh Launches\n"
+    f"Strategy: Search 'meme', 'ai' for volatility\n"
     f"Max: ${MAX_TRADE_SIZE} | SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}%"
 )
 time.sleep(2)
@@ -125,12 +126,12 @@ while True:
         keys_to_delete = [addr for addr, ts in recent.items() if (now_clean - ts).total_seconds() > 3600]
         for key in keys_to_delete: del recent[key]
 
-        print(f"\nScanning NEW PAIRS... (P&L: ${daily_pnl:.2f})")
+        print(f"\nScanning VOLATILE TOKENS... (P&L: ${daily_pnl:.2f})")
 
-        for chain in CHAINS:
+        for term in SEARCH_TERMS:
             try:
-                print(f"Fetching {chain['name']} New Pairs...")
-                resp = requests.get(chain["url"], timeout=10)
+                print(f"Searching '{term['query']}' on {term['name']}...")
+                resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={term['query']}", timeout=10)
                 
                 if resp.status_code != 200: 
                     print(f"API Error {resp.status_code}")
@@ -139,9 +140,14 @@ while True:
                 all_pairs = resp.json().get("pairs", [])
                 if not all_pairs: continue
 
-                # === PRO LOGIC: FILTER & SORT ===
-                valid_pairs = []
-                for p in all_pairs:
+                # Filter for this specific chain ID from the search results
+                chain_pairs = [p for p in all_pairs if p.get("chainId") == term["id"]]
+                if not chain_pairs: 
+                    print(f"No pairs found for {term['name']}")
+                    continue
+
+                # === PRO LOGIC: FILTER & SORT ===                valid_pairs = []
+                for p in chain_pairs:
                     base = p.get("baseToken", {})
                     addr = base.get("address")
                     if not addr: continue
@@ -151,13 +157,13 @@ while True:
                     chg = float((p.get("priceChange") or {}).get("m5", 0))
                     mcap = float(p.get("marketCap") or 0)
                     
-                    # Basic Pre-Filter
+                    # Basic Filters
                     if liq < MIN_LIQUIDITY or vol < MIN_VOLUME or chg < MIN_CHANGE:
                         continue
-                    if mcap > 0 and mcap < 5000: # Lower mcap for new pairs
+                    if mcap > 0 and mcap < 5000:
                         continue
-                        
-                    # Age Check (Optional for new pairs)
+                    
+                    # Age Check
                     created = p.get("pairCreatedAt")
                     if created:
                         age_h = (datetime.now().timestamp() * 1000 - created) / (1000 * 60 * 60)
@@ -171,7 +177,7 @@ while True:
                 
                 # Take Top 10 Movers
                 top_movers = valid_pairs[:10]
-                print(f"{chain['name']}: Found {len(valid_pairs)} valid. Trading Top {len(top_movers)} Movers.")
+                print(f"{term['name']}: Found {len(valid_pairs)} valid. Trading Top {len(top_movers)} Movers.")
 
                 for p in top_movers:
                     base  = p.get("baseToken", {})
@@ -182,22 +188,21 @@ while True:
                     vol   = float((p.get("volume") or {}).get("h24", 0))
                     chg   = float((p.get("priceChange") or {}).get("m5", 0))
 
-                    # Cooldown
                     now = datetime.now()
+                    # Cooldown Check
                     if addr in recent and (now - recent[addr]).total_seconds() < 1800:
                         continue
 
                     # Security Check
-                    is_safe, buy_tax, sell_tax = check_security(chain["id"], addr)
-                    if not is_safe or buy_tax > 10 or sell_tax > 10: # Relaxed tax for new pairs
-                        continue
+                    is_safe, buy_tax, sell_tax = check_security(term["id"], addr)
+                    if not is_safe or buy_tax > 10 or sell_tax > 10:                        continue
 
                     score, risk = calculate_score(liq, vol, chg, is_safe)
                     risk_label = {"low":"[LOW]", "medium":"[MED]", "high":"[HIGH]"}.get(risk, "[?]")
 
                     # === SOL: ALERT ONLY ===
-                    if not chain["trade"]:
-                        send(f"🔥 SOL NEW {risk_label} ${sym}\nScore: {score}/100 | +{chg}%\nhttps://dexscreener.com/{chain['id']}/{addr}")
+                    if not term["trade"]:
+                        send(f"🔥 {term['name']} NEW {risk_label} ${sym}\nScore: {score}/100 | +{chg}%\nhttps://dexscreener.com/{term['id']}/{addr}")
                         recent[addr] = now
                         continue
 
@@ -209,13 +214,13 @@ while True:
                         if pnl_pct <= STOP_LOSS_PCT:
                             pnl_usd = ((float(price) - entry) * active_trades[addr]["quantity"])
                             daily_pnl += pnl_usd
-                            send(f"🔴 STOP-LOSS ${sym} [BSC]\nP/L: ${pnl_usd:.4f} ({pnl_pct:.1f}%)")
+                            send(f"🔴 STOP-LOSS ${sym} [{term['name']}]\nP/L: ${pnl_usd:.4f} ({pnl_pct:.1f}%)")
                             del active_trades[addr]
                             recent[addr] = now
                         elif pnl_pct >= TAKE_PROFIT_PCT:
                             pnl_usd = ((float(price) - entry) * active_trades[addr]["quantity"])
                             daily_pnl += pnl_usd
-                            send(f"🟢 TAKE-PROFIT ${sym} [BSC]\nP/L: +${pnl_usd:.4f} (+{pnl_pct:.1f}%)")
+                            send(f"🟢 TAKE-PROFIT ${sym} [{term['name']}]\nP/L: +${pnl_usd:.4f} (+{pnl_pct:.1f}%)")
                             del active_trades[addr]
                             recent[addr] = now
                         continue
@@ -238,24 +243,24 @@ while True:
                         "entry_price": result["fill_price"],
                         "amount": trade_amt,
                         "quantity": qty,
-                        "chain": "BSC",
-                        "symbol": sym,
-                        "ts": now
+                        "chain": term["name"],
+                        "symbol": sym,                        "ts": now
                     }
                     recent[addr] = now
 
                     mode_lbl = "PAPER BUY" if PAPER_MODE else "LIVE BUY"
                     send(
-                        f"🚀 {mode_lbl} {risk_label} [BSC] ${sym}\n"                        f"Momentum: +{chg}% | Score: {score}/100\n"
+                        f"🚀 {mode_lbl} {risk_label} [{term['name']}] ${sym}\n"
+                        f"Momentum: +{chg}% | Score: {score}/100\n"
                         f"Entry: ${result['fill_price']:.8f}\n"
                         f"Amount: ${trade_amt:.2f} | Total: ${result['total_cost']:.2f}\n"
-                        f"https://dexscreener.com/bsc/{addr}"
+                        f"https://dexscreener.com/{term['id']}/{addr}"
                     )
                     print(f"{'PAPER' if PAPER_MODE else 'LIVE'} BUY: {sym} @ ${result['fill_price']:.8f}")
                     time.sleep(2)
 
             except Exception as e:
-                print(f"{chain['name']} error: {e}")
+                print(f"{term['name']} error: {e}")
                 continue
 
         print("Waiting 60 seconds...\n")
