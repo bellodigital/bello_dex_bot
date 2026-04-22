@@ -10,17 +10,17 @@ paper_env = os.getenv("PAPER_MODE", "true").lower().strip()
 PAPER_MODE = paper_env not in ["false", "0", "no"]
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 
-# FILTERS (Optimized for Momentum/Trending)
+# FILTERS (Relaxed for New Pairs)
 MAX_TRADE_SIZE   = float(os.getenv("MAX_TRADE_SIZE",   "1.0"))
 STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",    "-10"))
 TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT",  "20"))
 MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-5"))
 
-MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "20000"))
-MIN_VOLUME       = float(os.getenv("MIN_VOLUME",       "10000"))
-MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "2")) # Lowered to catch early trends
-MIN_AGE_HOURS    = float(os.getenv("MIN_AGE_HOURS",    "0.5"))
+MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "10000")) # Lower for new pairs
+MIN_VOLUME       = float(os.getenv("MIN_VOLUME",       "5000"))
+MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "1"))     # Catch small pumps
+MIN_AGE_HOURS    = float(os.getenv("MIN_AGE_HOURS",    "0"))     # Allow brand new
 
 # === STATE ===
 recent        = {}
@@ -34,7 +34,7 @@ app = Flask('')
 @app.route('/')
 def home():
     mode = "PAPER" if PAPER_MODE else "LIVE"
-    return f"NexusBot PRO {mode} | P&L: ${daily_pnl:.2f} | Pos: {len(active_trades)}/{MAX_POSITIONS}"
+    return f"NexusBot NEW PAIRS {mode} | P&L: ${daily_pnl:.2f} | Pos: {len(active_trades)}/{MAX_POSITIONS}"
 
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
@@ -87,27 +87,27 @@ def check_security(chain_id, addr):
 
 def calculate_score(liq, vol, chg, is_safe):
     score = 0
-    if liq >= 100000: score += 25
-    elif liq >= 50000: score += 15
+    if liq >= 50000: score += 25
+    elif liq >= 10000: score += 15
     if vol / max(liq, 1) > 1: score += 20
-    if chg >= 10: score += 25
-    elif chg >= 2: score += 15
+    if chg >= 5: score += 25
+    elif chg >= 1: score += 15
     if is_safe: score += 20
     risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
     return min(100, score), risk
 
-# === CHAINS CONFIG ===
-CHAINS = [    {"name": "BSC", "query": "bsc", "id": "56", "trade": True},
-    {"name": "SOL", "query": "solana", "id": "solana", "trade": False}
+# === CHAINS CONFIG (Using New Pairs Endpoint) ===
+CHAINS = [    {"name": "BSC", "url": "https://api.dexscreener.com/latest/dex/pairs/bsc", "id": "56", "trade": True},
+    {"name": "SOL", "url": "https://api.dexscreener.com/latest/dex/pairs/solana", "id": "solana", "trade": False}
 ]
 
 # === STARTUP ===
-print("NexusBot PRO starting...")
+print("NexusBot NEW PAIRS starting...")
 mode_tag = "PAPER MODE" if PAPER_MODE else "LIVE MODE"
 send(
-    f"NexusBot [{mode_tag}] PRO TRENDING LOGIC\n"
+    f"NexusBot [{mode_tag}] NEW PAIRS LOGIC\n"
     f"Trading: BSC | Watching: SOL\n"
-    f"Strategy: Sort by Momentum (Top Movers)\n"
+    f"Strategy: Scan Fresh Launches\n"
     f"Max: ${MAX_TRADE_SIZE} | SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}%"
 )
 time.sleep(2)
@@ -125,15 +125,16 @@ while True:
         keys_to_delete = [addr for addr, ts in recent.items() if (now_clean - ts).total_seconds() > 3600]
         for key in keys_to_delete: del recent[key]
 
-        print(f"\nScanning PRO TRENDING... (P&L: ${daily_pnl:.2f})")
+        print(f"\nScanning NEW PAIRS... (P&L: ${daily_pnl:.2f})")
 
         for chain in CHAINS:
             try:
-                print(f"Fetching {chain['name']} data...")
-                # Fetch MORE pairs to find the real trends
-                resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['query']}", timeout=10)
+                print(f"Fetching {chain['name']} New Pairs...")
+                resp = requests.get(chain["url"], timeout=10)
                 
-                if resp.status_code != 200: continue
+                if resp.status_code != 200: 
+                    print(f"API Error {resp.status_code}")
+                    continue
                 
                 all_pairs = resp.json().get("pairs", [])
                 if not all_pairs: continue
@@ -153,10 +154,10 @@ while True:
                     # Basic Pre-Filter
                     if liq < MIN_LIQUIDITY or vol < MIN_VOLUME or chg < MIN_CHANGE:
                         continue
-                    if mcap > 0 and mcap < 50000:
+                    if mcap > 0 and mcap < 5000: # Lower mcap for new pairs
                         continue
                         
-                    # Age Check
+                    # Age Check (Optional for new pairs)
                     created = p.get("pairCreatedAt")
                     if created:
                         age_h = (datetime.now().timestamp() * 1000 - created) / (1000 * 60 * 60)
@@ -188,7 +189,7 @@ while True:
 
                     # Security Check
                     is_safe, buy_tax, sell_tax = check_security(chain["id"], addr)
-                    if not is_safe or buy_tax > 5 or sell_tax > 5:
+                    if not is_safe or buy_tax > 10 or sell_tax > 10: # Relaxed tax for new pairs
                         continue
 
                     score, risk = calculate_score(liq, vol, chg, is_safe)
@@ -196,7 +197,7 @@ while True:
 
                     # === SOL: ALERT ONLY ===
                     if not chain["trade"]:
-                        send(f"🔥 SOL TRENDING {risk_label} ${sym}\nScore: {score}/100 | +{chg}%\nhttps://dexscreener.com/{chain['query']}/{addr}")
+                        send(f"🔥 SOL NEW {risk_label} ${sym}\nScore: {score}/100 | +{chg}%\nhttps://dexscreener.com/{chain['id']}/{addr}")
                         recent[addr] = now
                         continue
 
@@ -245,8 +246,8 @@ while True:
 
                     mode_lbl = "PAPER BUY" if PAPER_MODE else "LIVE BUY"
                     send(
-                        f"🚀 {mode_lbl} {risk_label} [BSC] ${sym}\n"
-                        f"Momentum: +{chg}% | Score: {score}/100\n"                        f"Entry: ${result['fill_price']:.8f}\n"
+                        f"🚀 {mode_lbl} {risk_label} [BSC] ${sym}\n"                        f"Momentum: +{chg}% | Score: {score}/100\n"
+                        f"Entry: ${result['fill_price']:.8f}\n"
                         f"Amount: ${trade_amt:.2f} | Total: ${result['total_cost']:.2f}\n"
                         f"https://dexscreener.com/bsc/{addr}"
                     )
