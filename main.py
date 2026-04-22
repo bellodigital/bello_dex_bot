@@ -47,7 +47,8 @@ def send(msg):
         except Exception as e:
             print("Discord Error:", e)
 
-def simulate_trade(symbol, price, amount_usd, side):    slippage = 0.5 + (amount_usd / 1000) * 0.1
+def simulate_trade(symbol, price, amount_usd, side):
+    slippage = 0.5 + (amount_usd / 1000) * 0.1
     gas = 0.25
     fill = price * (1 + slippage/100) if side == "buy" else price * (1 - slippage/100)
     return {
@@ -145,7 +146,8 @@ while True:
                 print(f"Scanning {chain['name']} Trending...")
                 resp = requests.get(chain["url"], timeout=10)
 
-                if resp.status_code != 200:                    print(f"{chain['name']} API error {resp.status_code}")
+                if resp.status_code != 200:
+                    print(f"{chain['name']} API error {resp.status_code}")
                     time.sleep(5)
                     continue
 
