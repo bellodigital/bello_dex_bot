@@ -10,17 +10,17 @@ paper_env = os.getenv("PAPER_MODE", "true").lower().strip()
 PAPER_MODE = paper_env not in ["false", "0", "no"]
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 
-# FILTERS (Optimized for Trending/Pumping Tokens)
+# FILTERS (Optimized for better signal flow)
 MAX_TRADE_SIZE   = float(os.getenv("MAX_TRADE_SIZE",   "1.0"))
 STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",    "-10"))
 TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT",  "20"))
 MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-5"))
 
-MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "30000")) # Higher liq for trending
-MIN_VOLUME       = float(os.getenv("MIN_VOLUME",       "20000"))
-MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "5"))     # Higher momentum for trends
-MIN_AGE_HOURS    = float(os.getenv("MIN_AGE_HOURS",    "1"))     # 1 hour min age
+MIN_LIQUIDITY    = float(os.getenv("MIN_LIQUIDITY",    "20000"))
+MIN_VOLUME       = float(os.getenv("MIN_VOLUME",       "10000"))
+MIN_CHANGE       = float(os.getenv("MIN_CHANGE",       "3")) # Back to 3% for stability
+MIN_AGE_HOURS    = float(os.getenv("MIN_AGE_HOURS",    "0.5")) # 30 mins
 
 # === STATE ===
 recent        = {}
@@ -34,7 +34,7 @@ app = Flask('')
 @app.route('/')
 def home():
     mode = "PAPER" if PAPER_MODE else "LIVE"
-    return f"NexusBot TRENDING {mode} | P&L: ${daily_pnl:.2f} | Pos: {len(active_trades)}/{MAX_POSITIONS}"
+    return f"NexusBot {mode} | P&L: ${daily_pnl:.2f} | Positions: {len(active_trades)}/{MAX_POSITIONS}"
 
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
@@ -47,8 +47,7 @@ def send(msg):
         except Exception as e:
             print("Discord Error:", e)
 
-def simulate_trade(symbol, price, amount_usd, side):
-    slippage = 0.5 + (amount_usd / 1000) * 0.1
+def simulate_trade(symbol, price, amount_usd, side):    slippage = 0.5 + (amount_usd / 1000) * 0.1
     gas = 0.25
     fill = price * (1 + slippage/100) if side == "buy" else price * (1 - slippage/100)
     return {
@@ -93,27 +92,27 @@ def calculate_score(liq, vol, chg, is_safe):
     score = 0
     if liq >= 100000: score += 25
     elif liq >= 50000: score += 15
-
+    
     if vol / max(liq, 1) > 1: score += 20
-
-    if chg >= 15: score += 25 # Higher reward for big pumps
-    elif chg >= 5: score += 15    
+    
+    if chg >= 10: score += 25
+    elif chg >= 3: score += 15    
     if is_safe: score += 20
-
+    
     risk = "low" if score >= 80 else "medium" if score >= 60 else "high"
     return min(100, score), risk
 
-# === CHAINS CONFIG (Using Trending/Boosts Endpoint) ===
+# === CHAINS CONFIG (Using Reliable Search Endpoint) ===
 CHAINS = [
-    {"name": "BSC", "url": "https://api.dexscreener.com/latest/dex/tokens/v1/top-gainers-losers/bsc", "id": "56", "trade": True},
-    {"name": "SOL", "url": "https://api.dexscreener.com/latest/dex/tokens/v1/top-gainers-losers/solana", "id": "solana", "trade": False}
+    {"name": "BSC", "query": "bsc", "id": "56", "trade": True},
+    {"name": "SOL", "query": "solana", "id": "solana", "trade": False}
 ]
 
 # === STARTUP ===
-print("NexusBot Trending starting...")
+print("NexusBot starting...")
 mode_tag = "PAPER MODE" if PAPER_MODE else "LIVE MODE"
 send(
-    f"NexusBot [{mode_tag}] TRENDING MODE\n"
+    f"NexusBot [{mode_tag}] Started\n"
     f"Trading: BSC | Watching: SOL\n"
     f"Filters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, Chg>{MIN_CHANGE}%\n"
     f"Max: ${MAX_TRADE_SIZE} | SL: {STOP_LOSS_PCT}% | TP: {TAKE_PROFIT_PCT}%"
@@ -139,13 +138,13 @@ while True:
         for key in keys_to_delete:
             del recent[key]
 
-        print(f"\nScanning TRENDING... (P&L: ${daily_pnl:.2f} | Positions: {len(active_trades)}/{MAX_POSITIONS})")
+        print(f"\nScanning... (P&L: ${daily_pnl:.2f} | Positions: {len(active_trades)}/{MAX_POSITIONS})")
 
         for chain in CHAINS:
             try:
-                print(f"Scanning {chain['name']} Trending...")
-                resp = requests.get(chain["url"], timeout=10)
-
+                print(f"Scanning {chain['name']}...")
+                # Using the reliable search endpoint
+                resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain['query']}", timeout=10)
                 if resp.status_code != 200:
                     print(f"{chain['name']} API error {resp.status_code}")
                     time.sleep(5)
@@ -153,10 +152,10 @@ while True:
 
                 pairs = resp.json().get("pairs", [])
                 if not pairs:
-                    print(f"{chain['name']}: No trending pairs returned")
+                    print(f"{chain['name']}: No pairs returned")
                     continue
 
-                print(f"{chain['name']}: Checking {len(pairs[:20])} trending pairs")
+                print(f"{chain['name']}: Checking {len(pairs[:20])} pairs")
 
                 for p in pairs[:20]:
                     base  = p.get("baseToken", {})
@@ -195,16 +194,16 @@ while True:
                     if not is_safe: continue
                     if buy_tax > 5 or sell_tax > 5: continue
 
-                    score, risk = calculate_score(liq, vol, chg, is_safe)
-                    risk_label  = {"low":"[LOW]", "medium":"[MED]", "high":"[HIGH]"}.get(risk, "[?]")
+                    score, risk = calculate_score(liq, vol, chg, is_safe)                    risk_label  = {"low":"[LOW]", "medium":"[MED]", "high":"[HIGH]"}.get(risk, "[?]")
+
                     # === SOL: ALERT ONLY ===
                     if not chain["trade"]:
                         send(
-                            f"🔥 SOL TRENDING {risk_label} ${sym}\n"
+                            f"SOL SIGNAL {risk_label} ${sym}\n"
                             f"Score: {score}/100 | Price: ${float(price):.8f}\n"
                             f"Liq: ${liq:,.0f} | Vol: ${vol:,.0f} | +{chg}%\n"
                             f"Tax: {buy_tax}%/{sell_tax}%\n"
-                            f"https://dexscreener.com/{chain['id']}/{addr}"
+                            f"https://dexscreener.com/{chain['query']}/{addr}"
                         )
                         recent[addr] = now
                         continue
@@ -244,8 +243,8 @@ while True:
                     result = simulate_trade(sym, float(price), trade_amt, "buy")
                     qty    = trade_amt / result["fill_price"]
 
-                    active_trades[addr] = {
-                        "entry_price": result["fill_price"],                        "amount":      trade_amt,
+                    active_trades[addr] = {                        "entry_price": result["fill_price"],
+                        "amount":      trade_amt,
                         "quantity":    qty,
                         "chain":       "BSC",
                         "symbol":      sym,
@@ -255,7 +254,7 @@ while True:
 
                     mode_lbl = "PAPER BUY" if PAPER_MODE else "LIVE BUY"
                     send(
-                        f"🔥 {mode_lbl} {risk_label} [BSC] ${sym}\n"
+                        f"{mode_lbl} {risk_label} [BSC] ${sym}\n"
                         f"Score: {score}/100 | Entry: ${result['fill_price']:.8f}\n"
                         f"Amount: ${trade_amt:.2f} | Slippage: {result['slippage_pct']}%\n"
                         f"Gas: ${result['gas_cost']} | Total: ${result['total_cost']:.2f}\n"
