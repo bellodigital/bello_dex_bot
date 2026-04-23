@@ -505,4 +505,21 @@ def main():
     log.info(f"  Take profit:    {TAKE_PROFIT_PCT}%")
     log.info(f"  Min liquidity:  ${MIN_LIQUIDITY:,.0f}")
     log.info(f"  Min volume:     ${MIN_VOLUME:,.0f}")
-    log.info(f"  Min 5m change:  {MIN_CHA
+    log.info(f"  Min 5m change:  {MIN_CHANGE}%")
+    log.info(f"  Min age (hrs):  {MIN_AGE_HOURS}")
+    log.info(f"  Scan interval:  {SCAN_INTERVAL_SEC}s")
+    log.info("=" * 60)
+
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    while True:
+        try:
+            run_scan_cycle()
+            maybe_cleanup_recent()
+        except Exception as e:
+            log.exception(f"Scan cycle error: {e}")
+        time.sleep(SCAN_INTERVAL_SEC)
+
+
+if __name__ == "__main__":
+    main()
