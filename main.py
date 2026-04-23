@@ -522,4 +522,20 @@ def main():
         f"**Stop loss:**   `{STOP_LOSS_PCT}%`\n"
         f"**Take profit:** `{TAKE_PROFIT_PCT}%`\n"
         f"**Min liq:**     `${MIN_LIQUIDITY:,.0f}`\n"
-        f"*
+        f"**Min vol:**     `${MIN_VOLUME:,.0f}`\n"
+        f"**Min 5m chg:**  `{MIN_CHANGE}%`\n"
+        f"**Scan every:**  `{SCAN_INTERVAL_SEC}s`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    while True:
+        try:
+            run_scan_cycle()
+            maybe_cleanup_recent()
+        except Exception as e:
+            log.exception(f"Scan cycle error: {e}")
+        time.sleep(SCAN_INTERVAL_SEC)
+
+
+if __name__ == "__main__":
+    main()
