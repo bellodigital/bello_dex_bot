@@ -25,77 +25,122 @@ logger = logging.getLogger("scalper")
 # ----------------------------------------------------------------------
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-TARGET_CHAIN = os.getenv("TARGET_CHAIN", "bsc")  # DexScreener chain identifier
+TARGET_CHAIN = os.getenv("TARGET_CHAIN", "bsc")
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "1.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-10.0"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "20.0"))
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000.0"))
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))        # m5 price change %
+MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
+
 # GoPlus numeric chain IDs
 CHAIN_ID_MAP = {
-    "bsc": 56,
-    "ethereum": 1,
-    "polygon": 137,
-    "avalanche": 43114,
-    "fantom": 250,
-    "arbitrum": 42161,
-    "optimism": 10,
-    "base": 8453,
+    "bsc": 56, "ethereum": 1, "polygon": 137, "avalanche": 43114,
+    "fantom": 250, "arbitrum": 42161, "optimism": 10, "base": 8453,
 }
 TARGET_CHAIN_NUMERIC = CHAIN_ID_MAP.get(TARGET_CHAIN, 56)
-# List of volatile keywords to search for trending tokens
+
+# Fallback search terms (used only if boosted tokens don't yield enough)
 SEARCH_TERMS = [
-    "pepe", "shib", "doge", "elon", "floki", "woof", "moon",
-    "inu", "baby", "pump", "king", "rocket", "cat", "frog",
-    "ai", "gpt", "dragon", "bot", "safe", "moon", "based",
-    "chad", "wojak", "basedai", "comfy", "pepedoge"
+    "pepe", "shib", "doge", "elon", "floki", "moon",
+    "inu", "baby", "pump", "king", "rocket", "cat",
+    "ai", "gpt", "bot", "safe", "based", "chad",
 ]
 
 # ----------------------------------------------------------------------
 # Global State (for paper trading)
 # ----------------------------------------------------------------------
-active_trades: Dict[str, dict] = {}  # token_address -> trade info
-recent: Dict[str, float] = {}        # token_address -> last buy timestamp (to enforce cooldown)
-trade_lock = threading.Lock()        # protects active_trades and recent
+active_trades: Dict[str, dict] = {}
+recent: Dict[str, float] = {}
+trade_lock = threading.Lock()
+scan_cycle_count = 0  # for periodic status logging
 
 # ----------------------------------------------------------------------
-# Helper Functions
+# Discord Alerts
 # ----------------------------------------------------------------------
 def send_discord_alert(content: str, embed: dict = None) -> bool:
-    """Send a message to Discord via webhook. Returns True on success."""
     if not DISCORD_WEBHOOK_URL:
-        logger.warning("Discord webhook URL not set, cannot send alert.")
         return False
     payload = {"content": content}
     if embed:
         payload["embeds"] = [embed]
     try:
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        if resp.status_code == 204:
-            return True
-        logger.error(f"Discord webhook error {resp.status_code}: {resp.text}")
+        return resp.status_code == 204
     except Exception as e:
-        logger.error(f"Discord webhook exception: {e}")
-    return False
+        logger.error(f"Discord webhook error: {e}")
+        return False
 
+# ----------------------------------------------------------------------
+# === NEW: Token Boosts API — Primary Trending Source ===
+# ----------------------------------------------------------------------
+def fetch_boosted_tokens(endpoint: str = "latest") -> List[dict]:
+    """
+    Fetch trending tokens from DexScreener's token-boosts API.
+    endpoint: 'latest' or 'top'
+    Returns list of dicts with keys: chainId, tokenAddress, amount, totalAmount
+    """
+    url = f"https://api.dexscreener.com/token-boosts/{endpoint}/v1"
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 429:
+            logger.warning("Token-boosts API rate limited (429). Skipping this cycle.")
+            return []
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict) and "url" in data:
+            # Single object returned — wrap in list
+            return [data]
+        else:
+            logger.debug(f"Unexpected token-boosts response format: {type(data)}")
+            return []
+    except Exception as e:
+        logger.error(f"Error fetching boosted tokens ({endpoint}): {e}")
+        return []
+
+def fetch_pair_by_address(token_address: str) -> Optional[dict]:
+    """
+    Fetch full pair data for a token by searching its address.
+    Returns the first pair dict from DexScreener, or None.
+    """
+    url = f"https://api.dexscreener.com/latest/dex/search?q={token_address}"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 429:
+            logger.warning("Search API rate limited (429).")
+            return None
+        data = resp.json()
+        pairs = data.get("pairs", [])
+        if pairs:
+            # Return the first pair (usually highest liquidity)
+            return pairs[0]
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching pair for {token_address}: {e}")
+        return None
+
+# ----------------------------------------------------------------------
+# Keyword Search (Keep as supplementary)
+# ----------------------------------------------------------------------
 def fetch_dex_pairs(query: str) -> List[dict]:
-    """Fetch a list of trading pairs from DexScreener search API."""
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
     try:
         resp = requests.get(url, timeout=15)
+        if resp.status_code == 429:
+            logger.warning("Search API rate limited (429).")
+            return []
         data = resp.json()
-        pairs = data.get("pairs", [])
-        if not pairs:
-            logger.debug(f"No pairs found for query '{query}'")
-        return pairs
+        return data.get("pairs", [])
     except Exception as e:
         logger.error(f"Error fetching DexScreener pairs for '{query}': {e}")
         return []
 
+# ----------------------------------------------------------------------
+# Filtering
+# ----------------------------------------------------------------------
 def filter_pairs(pairs: List[dict]) -> List[dict]:
-    """Apply pre-filters: chain, liquidity, volume, price change, age."""
     now_ms = int(time.time() * 1000)
     valid = []
     for pair in pairs:
@@ -111,19 +156,20 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
                 continue
             if MIN_AGE_HOURS > 0 and age_hours < MIN_AGE_HOURS:
                 continue
-            # Attach calculated fields for convenience
             pair["_liq"] = liq
             pair["_vol"] = vol
             pair["_m5"] = m5
             pair["_age_hours"] = age_hours
             valid.append(pair)
         except Exception as e:
-            logger.debug(f"Skipping pair due to filter error: {e}")
+            logger.debug(f"Filter error: {e}")
             continue
     return valid
 
+# ----------------------------------------------------------------------
+# Security
+# ----------------------------------------------------------------------
 def get_token_security(chain_id: int, token_address: str) -> Optional[dict]:
-    """Fetch token security info from GoPlus API."""
     url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
     params = {"contract_addresses": token_address}
     try:
@@ -132,31 +178,21 @@ def get_token_security(chain_id: int, token_address: str) -> Optional[dict]:
         if data.get("code") != 1:
             logger.error(f"GoPlus API error for {token_address}: {data.get('message')}")
             return None
-        result = data.get("result", {}).get(token_address.lower(), None)
-        if not result:
-            logger.warning(f"No security data for {token_address}")
-            return None
-        return result
+        return data.get("result", {}).get(token_address.lower(), None)
     except Exception as e:
         logger.error(f"GoPlus API exception for {token_address}: {e}")
         return None
 
 def is_token_safe(security_data: Optional[dict]) -> bool:
-    """
-    Check if token passes security checks.
-    Returns True if safe, False if any check fails or data is missing.
-    """
     if not security_data:
-        return False  # Assume unsafe on any failure
+        return False
     try:
         honeypot = security_data.get("is_honeypot", "1")
         buy_tax = float(security_data.get("buy_tax", "100"))
         sell_tax = float(security_data.get("sell_tax", "100"))
         if honeypot != "0":
-            logger.info("Token flagged as honeypot")
             return False
         if buy_tax > 10 or sell_tax > 10:
-            logger.info(f"High taxes: buy={buy_tax}%, sell={sell_tax}%")
             return False
         return True
     except Exception as e:
@@ -164,7 +200,6 @@ def is_token_safe(security_data: Optional[dict]) -> bool:
         return False
 
 def calculate_pair_score(pair: dict, is_safe: bool) -> float:
-    """Simple 0-100 score based on liquidity, volume, momentum and safety."""
     try:
         liq = pair.get("_liq", 0)
         vol = pair.get("_vol", 0)
@@ -173,16 +208,14 @@ def calculate_pair_score(pair: dict, is_safe: bool) -> float:
         vol_score = min(vol / 50000, 1) * 20
         momentum_score = min(abs(m5) / 10, 1) * 30
         safety_score = 20 if is_safe else 0
-        total = liq_score + vol_score + momentum_score + safety_score
-        return round(total, 2)
+        return round(liq_score + vol_score + momentum_score + safety_score, 2)
     except:
         return 0.0
 
+# ----------------------------------------------------------------------
+# Paper Trading
+# ----------------------------------------------------------------------
 def simulate_buy(pair: dict) -> Optional[dict]:
-    """
-    Simulate a paper trade entry. Checks cooldown and existing position.
-    Returns the trade dict if successful, else None.
-    """
     token_addr = pair.get("baseToken", {}).get("address", "").lower()
     pair_addr = pair.get("pairAddress", "")
     if not token_addr or not pair_addr:
@@ -190,25 +223,18 @@ def simulate_buy(pair: dict) -> Optional[dict]:
 
     now = time.time()
     with trade_lock:
-        # Cooldown check
-        if token_addr in recent and (now - recent[token_addr]) < 1800:  # 30 minutes
-            logger.info(f"Cooldown active for {token_addr}, skipping buy")
+        if token_addr in recent and (now - recent[token_addr]) < 1800:
             return None
-        # Already holding?
         if token_addr in active_trades:
-            logger.info(f"Already holding {token_addr}, skipping duplicate")
             return None
-
         try:
             price = float(pair.get("priceUsd", 0))
             if price <= 0:
                 return None
-            # Simulate slippage: 0.5% base + 0.1% per $1000 trade size
             trade_usd = MAX_TRADE_SIZE
             slippage_pct = 0.5 + (trade_usd / 1000) * 0.1
             entry_price = price * (1 + slippage_pct / 100)
             quantity = trade_usd / entry_price
-
             trade = {
                 "token": pair["baseToken"]["symbol"],
                 "token_address": token_addr,
@@ -217,7 +243,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
                 "amount_usd": trade_usd,
                 "quantity": quantity,
                 "timestamp": now,
-                "score": 0.0,  # will be set later
+                "score": 0.0,
             }
             active_trades[token_addr] = trade
             recent[token_addr] = now
@@ -228,35 +254,26 @@ def simulate_buy(pair: dict) -> Optional[dict]:
             return None
 
 def monitor_positions() -> List[dict]:
-    """
-    Check all open paper trades for stop-loss / take-profit.
-    Returns a list of closed trades (for alerting).
-    """
     closed = []
     with trade_lock:
-        # Copy items to avoid dict size change during iteration
         items = list(active_trades.items())
     for token_addr, trade in items:
         try:
             pair_addr = trade["pair_address"]
-            chain = TARGET_CHAIN  # we only trade on one chain
+            chain = TARGET_CHAIN
             url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}"
             resp = requests.get(url, timeout=10)
             data = resp.json()
             pair_data = data.get("pair")
             if not pair_data:
-                logger.warning(f"Could not fetch pair for {pair_addr}")
                 continue
             current_price = float(pair_data.get("priceUsd", 0))
             if current_price <= 0:
                 continue
-
             entry_price = trade["entry_price"]
             pct_change = ((current_price - entry_price) / entry_price) * 100
-            logger.debug(f"{trade['token']} PnL: {pct_change:.2f}%")
 
             if pct_change <= STOP_LOSS_PCT:
-                # Simulated stop-loss
                 with trade_lock:
                     closed_trade = active_trades.pop(token_addr, None)
                 if closed_trade:
@@ -286,22 +303,21 @@ def monitor_positions() -> List[dict]:
     return closed
 
 def clean_memory():
-    """Remove outdated entries from the `recent` cooldown dict."""
     now = time.time()
     with trade_lock:
-        stale = [addr for addr, ts in recent.items() if now - ts > 1800]  # 30 min
+        stale = [addr for addr, ts in recent.items() if now - ts > 1800]
         for addr in stale:
             del recent[addr]
         if stale:
             logger.debug(f"Cleaned {len(stale)} old cooldown entries")
 
 # ----------------------------------------------------------------------
-# Core Scanner Loop
+# Main Scanner Loop (REVISED — Boosts API first, then keyword fallback)
 # ----------------------------------------------------------------------
 def scanner_loop():
-    """Main loop: scan, filter, security check, trade, monitor, clean."""
+    global scan_cycle_count
     logger.info("=" * 50)
-    logger.info("SCALPER BOT STARTED")
+    logger.info("SCALPER BOT STARTED (v2 — Token Boosts + Keyword Search)")
     logger.info(f"Paper Mode: {PAPER_MODE}, Chain: {TARGET_CHAIN} ({TARGET_CHAIN_NUMERIC})")
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
     logger.info(f"Min Liq: ${MIN_LIQUIDITY}, Vol: ${MIN_VOLUME}, m5%: {MIN_CHANGE}, Age: {MIN_AGE_HOURS}h")
@@ -310,27 +326,46 @@ def scanner_loop():
     last_clean = time.time()
     while True:
         try:
-            # --- 1. Collect candidate pairs from DexScreener using volatile keywords ---
+            scan_cycle_count += 1
             all_pairs = []
-            for term in SEARCH_TERMS:
-                pairs = fetch_dex_pairs(term)
-                all_pairs.extend(pairs)
-                time.sleep(0.2)  # respect API rate limits
 
-            # Deduplicate by pair address
-            seen = set()
-            uniq_pairs = []
-            for p in all_pairs:
-                addr = p.get("pairAddress")
-                if addr and addr not in seen:
-                    seen.add(addr)
-                    uniq_pairs.append(p)
+            # === STEP 1: Get trending tokens from Boosts API ===
+            logger.debug("Fetching trending tokens from token-boosts API...")
+            boosted = fetch_boosted_tokens("latest")
+            if boosted:
+                logger.info(f"Boosts API returned {len(boosted)} tokens")
+                # Filter to target chain
+                chain_boosted = [b for b in boosted if b.get("chainId") == TARGET_CHAIN]
+                logger.info(f"  → {len(chain_boosted)} on chain '{TARGET_CHAIN}'")
+                # Fetch full pair data for each boosted token
+                for b in chain_boosted[:15]:  # limit to avoid rate issues
+                    token_addr = b.get("tokenAddress", "")
+                    if not token_addr:
+                        continue
+                    pair = fetch_pair_by_address(token_addr)
+                    if pair:
+                        all_pairs.append(pair)
+                    time.sleep(0.15)  # small delay between calls
+                logger.info(f"  → Fetched pair data for {len(all_pairs)} boosted tokens")
 
-            # --- 2. Pre-filter ---
-            valid_pairs = filter_pairs(uniq_pairs)
-            # Sort by m5 change descending
+            # === STEP 2: Supplement with keyword search if not enough candidates ===
+            if len(all_pairs) < 20:
+                logger.debug("Supplementing with keyword search...")
+                seen = set(p.get("pairAddress") for p in all_pairs)
+                for term in SEARCH_TERMS[:8]:  # fewer terms to stay within rate limits
+                    pairs = fetch_dex_pairs(term)
+                    for p in pairs:
+                        addr = p.get("pairAddress")
+                        if addr and addr not in seen:
+                            seen.add(addr)
+                            all_pairs.append(p)
+                    time.sleep(0.25)
+                logger.debug(f"  → Total unique pairs after keyword search: {len(all_pairs)}")
+
+            # === STEP 3: Filter ===
+            valid_pairs = filter_pairs(all_pairs)
             valid_pairs.sort(key=lambda x: x.get("_m5", 0), reverse=True)
-            # Top 10 momentum tokens (unique base token)
+            # Top 10 unique tokens
             seen_tokens = set()
             top_pairs = []
             for p in valid_pairs:
@@ -342,26 +377,31 @@ def scanner_loop():
                     break
             logger.info(f"Top momentum tokens after filtering: {len(top_pairs)}")
 
-            # --- 3. Security Checks & Trading ---
+            # === STEP 3.5: Periodic status for open positions ===
+            if scan_cycle_count % 5 == 0:
+                with trade_lock:
+                    open_count = len(active_trades)
+                if open_count > 0:
+                    logger.info(f"📊 STATUS: {open_count} open position(s) — cycle #{scan_cycle_count}")
+                    for addr, t in active_trades.items():
+                        logger.info(f"   • {t['token']}: entry ${t['entry_price']:.8f}, amount ${t['amount_usd']:.2f}")
+                else:
+                    logger.info(f"📊 STATUS: No open positions — cycle #{scan_cycle_count}")
+
+            # === STEP 4: Security Checks & Trading ===
             for pair in top_pairs:
                 token_addr = pair["baseToken"]["address"]
-                # Security check via GoPlus
                 security = get_token_security(TARGET_CHAIN_NUMERIC, token_addr)
                 safe = is_token_safe(security)
                 if not safe:
                     logger.info(f"Token {pair['baseToken']['symbol']} failed security, skipping")
                     continue
-
-                # Only trade in paper mode
                 if not PAPER_MODE:
                     logger.info("Paper mode disabled, skipping live trade")
                     continue
-
-                # Attempt simulated buy (function handles cooldown & duplicate)
                 trade = simulate_buy(pair)
                 if trade:
                     trade["score"] = calculate_pair_score(pair, safe)
-                    # Send Discord alert for entry
                     embed = {
                         "title": f"🟢 PAPER BUY: {trade['token']}",
                         "color": 0x00FF00,
@@ -377,7 +417,7 @@ def scanner_loop():
                     }
                     send_discord_alert("New paper trade entered", embed)
 
-            # --- 4. Monitor existing positions for SL/TP ---
+            # === STEP 5: Monitor Positions ===
             closed_trades = monitor_positions()
             for ct in closed_trades:
                 reason = ct["exit_reason"]
@@ -396,12 +436,11 @@ def scanner_loop():
                 }
                 send_discord_alert(f"Paper {reason.lower()} executed", embed)
 
-            # --- 5. Memory cleanup (every 10 minutes) ---
+            # === STEP 6: Memory Cleanup ===
             if time.time() - last_clean > 600:
                 clean_memory()
                 last_clean = time.time()
 
-            # Wait before next full scan
             time.sleep(60)
 
         except Exception as e:
@@ -409,51 +448,41 @@ def scanner_loop():
             time.sleep(30)
 
 # ----------------------------------------------------------------------
-# Flask Server to keep Railway awake and show status
+# Flask Server
 # ----------------------------------------------------------------------
 app = Flask(__name__)
 
 @app.route("/")
 def status():
-    """Return bot status and current positions."""
     with trade_lock:
         trades_list = []
         for addr, t in active_trades.items():
             trades_list.append({
-                "token": t["token"],
-                "address": addr,
-                "entry_price": t["entry_price"],
-                "amount_usd": t["amount_usd"],
-                "timestamp": t["timestamp"],
+                "token": t.get("token"),
+                "token_address": t.get("token_address"),
+                "pair_address": t.get("pair_address"),
+                "entry_price": t.get("entry_price"),
+                "amount_usd": t.get("amount_usd"),
+                "quantity": t.get("quantity"),
+                "score": t.get("score"),
+                "timestamp": t.get("timestamp"),
             })
-        recent_count = len(recent)
     return jsonify({
         "status": "running",
         "paper_mode": PAPER_MODE,
-        "active_trades": len(active_trades),
-        "cooldown_entries": recent_count,
+        "target_chain": TARGET_CHAIN,
+        "scan_cycles": scan_cycle_count,
+        "active_trades": len(trades_list),
         "trades": trades_list,
-        "server_time": datetime.now(timezone.utc).isoformat(),
     })
 
-def start_flask():
-    """Run Flask in a background thread on the required port."""
-    port = int(os.getenv("PORT", "8080"))
-    logger.info(f"Starting flask server on port {port}")
-    # Use threading to avoid blocking the main scanner
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ----------------------------------------------------------------------
-# Entry Point
-# ----------------------------------------------------------------------
+def run_flask():
+    port = int(os.getenv("PORT", "8080"))
+    logger.info(f"Flask health server starting on port {port}")
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
 if __name__ == "__main__":
-    # Validate mandatory webhook
-    if not DISCORD_WEBHOOK_URL:
-        logger.warning("DISCORD_WEBHOOK_URL not set – alerts disabled")
-    # Start Flask in a daemon thread
-    flask_thread = threading.Thread(target=start_flask, daemon=True)
-    flask_thread.start()
-    # Give Flask a second to start
-    time.sleep(1)
-    # Run main scanner loop forever
+    threading.Thread(target=run_flask, daemon=True).start()
     scanner_loop()
