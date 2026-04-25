@@ -27,14 +27,30 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TARGET_CHAIN = os.getenv("TARGET_CHAIN", "bsc")
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "1.0"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-10.0"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "20.0"))
+
+# Scalping defaults — tight TP/SL
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-2.0"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
+
+# Trailing stop
+TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "1.5"))  # profit % when trailing starts
+TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "1.0"))      # distance % behind highest price
+
+# Max hold time (minutes) — 0 = disabled
+MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))
+
+# Slippage
+SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))  # flat 0.3% for small trades
+
+# Filters
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000.0"))
 MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
+MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "1e-8"))
 
-# GoPlus numeric chain IDs
+# Chain mapping
 CHAIN_ID_MAP = {
     "bsc": 56, "ethereum": 1, "polygon": 137, "avalanche": 43114,
     "fantom": 250, "arbitrum": 42161, "optimism": 10, "base": 8453,
@@ -49,12 +65,12 @@ SEARCH_TERMS = [
 ]
 
 # ----------------------------------------------------------------------
-# Global State (for paper trading)
+# Global State
 # ----------------------------------------------------------------------
-active_trades: Dict[str, dict] = {}
-recent: Dict[str, float] = {}
+active_trades: Dict[str, dict] = {}  # token_address -> trade info (includes highest_price)
+recent: Dict[str, float] = {}        # token_address -> last buy timestamp
 trade_lock = threading.Lock()
-scan_cycle_count = 0  # for periodic status logging
+scan_cycle_count = 0
 
 # ----------------------------------------------------------------------
 # Discord Alerts
@@ -73,63 +89,43 @@ def send_discord_alert(content: str, embed: dict = None) -> bool:
         return False
 
 # ----------------------------------------------------------------------
-# === NEW: Token Boosts API — Primary Trending Source ===
+# APIs
 # ----------------------------------------------------------------------
 def fetch_boosted_tokens(endpoint: str = "latest") -> List[dict]:
-    """
-    Fetch trending tokens from DexScreener's token-boosts API.
-    endpoint: 'latest' or 'top'
-    Returns list of dicts with keys: chainId, tokenAddress, amount, totalAmount
-    """
     url = f"https://api.dexscreener.com/token-boosts/{endpoint}/v1"
     try:
         resp = requests.get(url, timeout=15)
         if resp.status_code == 429:
-            logger.warning("Token-boosts API rate limited (429). Skipping this cycle.")
+            logger.warning("Token-boosts API rate limited (429).")
             return []
         data = resp.json()
         if isinstance(data, list):
             return data
         elif isinstance(data, dict) and "url" in data:
-            # Single object returned — wrap in list
             return [data]
-        else:
-            logger.debug(f"Unexpected token-boosts response format: {type(data)}")
-            return []
+        return []
     except Exception as e:
         logger.error(f"Error fetching boosted tokens ({endpoint}): {e}")
         return []
 
 def fetch_pair_by_address(token_address: str) -> Optional[dict]:
-    """
-    Fetch full pair data for a token by searching its address.
-    Returns the first pair dict from DexScreener, or None.
-    """
     url = f"https://api.dexscreener.com/latest/dex/search?q={token_address}"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 429:
-            logger.warning("Search API rate limited (429).")
             return None
         data = resp.json()
         pairs = data.get("pairs", [])
-        if pairs:
-            # Return the first pair (usually highest liquidity)
-            return pairs[0]
-        return None
+        return pairs[0] if pairs else None
     except Exception as e:
         logger.error(f"Error fetching pair for {token_address}: {e}")
         return None
 
-# ----------------------------------------------------------------------
-# Keyword Search (Keep as supplementary)
-# ----------------------------------------------------------------------
 def fetch_dex_pairs(query: str) -> List[dict]:
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
     try:
         resp = requests.get(url, timeout=15)
         if resp.status_code == 429:
-            logger.warning("Search API rate limited (429).")
             return []
         data = resp.json()
         return data.get("pairs", [])
@@ -146,6 +142,9 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
     for pair in pairs:
         try:
             if pair.get("chainId") != TARGET_CHAIN:
+                continue
+            price = float(pair.get("priceUsd", 0))
+            if price < MIN_PRICE_USD:
                 continue
             liq = float(pair.get("liquidity", {}).get("usd", 0))
             vol = float(pair.get("volume", {}).get("h24", 0))
@@ -190,13 +189,8 @@ def is_token_safe(security_data: Optional[dict]) -> bool:
         honeypot = security_data.get("is_honeypot", "1")
         buy_tax = float(security_data.get("buy_tax", "100"))
         sell_tax = float(security_data.get("sell_tax", "100"))
-        if honeypot != "0":
-            return False
-        if buy_tax > 10 or sell_tax > 10:
-            return False
-        return True
-    except Exception as e:
-        logger.error(f"Safety check error: {e}")
+        return honeypot == "0" and buy_tax <= 10 and sell_tax <= 10
+    except:
         return False
 
 def calculate_pair_score(pair: dict, is_safe: bool) -> float:
@@ -213,7 +207,7 @@ def calculate_pair_score(pair: dict, is_safe: bool) -> float:
         return 0.0
 
 # ----------------------------------------------------------------------
-# Paper Trading
+# Paper Trading — Entry
 # ----------------------------------------------------------------------
 def simulate_buy(pair: dict) -> Optional[dict]:
     token_addr = pair.get("baseToken", {}).get("address", "").lower()
@@ -232,9 +226,9 @@ def simulate_buy(pair: dict) -> Optional[dict]:
             if price <= 0:
                 return None
             trade_usd = MAX_TRADE_SIZE
-            slippage_pct = 0.5 + (trade_usd / 1000) * 0.1
-            entry_price = price * (1 + slippage_pct / 100)
+            entry_price = price * (1 + SLIPPAGE_PCT / 100)
             quantity = trade_usd / entry_price
+
             trade = {
                 "token": pair["baseToken"]["symbol"],
                 "token_address": token_addr,
@@ -244,6 +238,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
                 "quantity": quantity,
                 "timestamp": now,
                 "score": 0.0,
+                "highest_price": entry_price,   # for trailing stop
             }
             active_trades[token_addr] = trade
             recent[token_addr] = now
@@ -253,53 +248,84 @@ def simulate_buy(pair: dict) -> Optional[dict]:
             logger.error(f"Simulate buy error: {e}")
             return None
 
+# ----------------------------------------------------------------------
+# Monitoring & Exits (with trailing stop + max hold)
+# ----------------------------------------------------------------------
 def monitor_positions() -> List[dict]:
     closed = []
+    now = time.time()
+
     with trade_lock:
+        # snapshot items to safely iterate
         items = list(active_trades.items())
+
     for token_addr, trade in items:
         try:
             pair_addr = trade["pair_address"]
-            chain = TARGET_CHAIN
-            url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_addr}"
+            url = f"https://api.dexscreener.com/latest/dex/pairs/{TARGET_CHAIN}/{pair_addr}"
             resp = requests.get(url, timeout=10)
             data = resp.json()
             pair_data = data.get("pair")
             if not pair_data:
                 continue
+
             current_price = float(pair_data.get("priceUsd", 0))
             if current_price <= 0:
                 continue
+
             entry_price = trade["entry_price"]
             pct_change = ((current_price - entry_price) / entry_price) * 100
 
-            if pct_change <= STOP_LOSS_PCT:
+            # Update highest price for trailing stop
+            with trade_lock:
+                if token_addr in active_trades:
+                    if current_price > active_trades[token_addr]["highest_price"]:
+                        active_trades[token_addr]["highest_price"] = current_price
+
+            # --- Check exit conditions ---
+            exit_reason = None
+            exit_price = current_price
+
+            # 1. Fixed TP/SL
+            if pct_change >= TAKE_PROFIT_PCT:
+                exit_reason = "TAKE_PROFIT"
+            elif pct_change <= STOP_LOSS_PCT:
+                exit_reason = "STOP_LOSS"
+
+            # 2. Trailing stop (only if enabled and no TP/SL triggered yet)
+            if exit_reason is None and TRAILING_STOP_ENABLED:
+                highest = trade.get("highest_price", entry_price)
+                # Check if profit has reached activation level
+                profit_from_high = ((highest - entry_price) / entry_price) * 100
+                if profit_from_high >= TRAILING_ACTIVATION_PCT:
+                    # Trailing stop level
+                    trailing_stop_price = highest * (1 - TRAILING_DISTANCE_PCT / 100)
+                    if current_price <= trailing_stop_price:
+                        exit_reason = "TRAILING_STOP"
+
+            # 3. Max hold time (if set)
+            if exit_reason is None and MAX_HOLD_MINUTES > 0:
+                age_min = (now - trade.get("timestamp", now)) / 60
+                if age_min >= MAX_HOLD_MINUTES:
+                    exit_reason = "MAX_HOLD"
+
+            # --- Execute exit if triggered ---
+            if exit_reason:
                 with trade_lock:
                     closed_trade = active_trades.pop(token_addr, None)
                 if closed_trade:
-                    closed_trade["exit_price"] = current_price
-                    closed_trade["exit_reason"] = "STOP_LOSS"
+                    closed_trade["exit_price"] = exit_price
+                    closed_trade["exit_reason"] = exit_reason
                     closed_trade["pnl_pct"] = round(pct_change, 2)
                     closed_trade["pnl_usd"] = round(
-                        closed_trade["quantity"] * current_price - closed_trade["amount_usd"], 2
+                        closed_trade["quantity"] * exit_price - closed_trade["amount_usd"], 2
                     )
                     closed.append(closed_trade)
-                    logger.info(f"STOP LOSS: {closed_trade['token']} at {pct_change:.2f}%")
-            elif pct_change >= TAKE_PROFIT_PCT:
-                with trade_lock:
-                    closed_trade = active_trades.pop(token_addr, None)
-                if closed_trade:
-                    closed_trade["exit_price"] = current_price
-                    closed_trade["exit_reason"] = "TAKE_PROFIT"
-                    closed_trade["pnl_pct"] = round(pct_change, 2)
-                    closed_trade["pnl_usd"] = round(
-                        closed_trade["quantity"] * current_price - closed_trade["amount_usd"], 2
-                    )
-                    closed.append(closed_trade)
-                    logger.info(f"TAKE PROFIT: {closed_trade['token']} at {pct_change:.2f}%")
+                    logger.info(f"{exit_reason}: {closed_trade['token']} at {pct_change:.2f}%")
         except Exception as e:
             logger.error(f"Monitor error for {trade.get('token','')}: {e}")
             continue
+
     return closed
 
 def clean_memory():
@@ -312,15 +338,16 @@ def clean_memory():
             logger.debug(f"Cleaned {len(stale)} old cooldown entries")
 
 # ----------------------------------------------------------------------
-# Main Scanner Loop (REVISED — Boosts API first, then keyword fallback)
+# Main Scanner Loop
 # ----------------------------------------------------------------------
 def scanner_loop():
     global scan_cycle_count
     logger.info("=" * 50)
-    logger.info("SCALPER BOT STARTED (v2 — Token Boosts + Keyword Search)")
+    logger.info("SCALPER BOT STARTED (v3 — Tight TP/SL + Trailing Stop)")
     logger.info(f"Paper Mode: {PAPER_MODE}, Chain: {TARGET_CHAIN} ({TARGET_CHAIN_NUMERIC})")
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
-    logger.info(f"Min Liq: ${MIN_LIQUIDITY}, Vol: ${MIN_VOLUME}, m5%: {MIN_CHANGE}, Age: {MIN_AGE_HOURS}h")
+    logger.info(f"Trailing: {TRAILING_STOP_ENABLED}, Activation: {TRAILING_ACTIVATION_PCT}%, Distance: {TRAILING_DISTANCE_PCT}%")
+    logger.info(f"Max Hold: {MAX_HOLD_MINUTES} min (0=off), Slippage: {SLIPPAGE_PCT}%")
     logger.info("=" * 50)
 
     last_clean = time.time()
@@ -329,30 +356,26 @@ def scanner_loop():
             scan_cycle_count += 1
             all_pairs = []
 
-            # === STEP 1: Get trending tokens from Boosts API ===
+            # 1. Boosts API
             logger.debug("Fetching trending tokens from token-boosts API...")
             boosted = fetch_boosted_tokens("latest")
             if boosted:
                 logger.info(f"Boosts API returned {len(boosted)} tokens")
-                # Filter to target chain
                 chain_boosted = [b for b in boosted if b.get("chainId") == TARGET_CHAIN]
                 logger.info(f"  → {len(chain_boosted)} on chain '{TARGET_CHAIN}'")
-                # Fetch full pair data for each boosted token
-                for b in chain_boosted[:15]:  # limit to avoid rate issues
-                    token_addr = b.get("tokenAddress", "")
-                    if not token_addr:
-                        continue
-                    pair = fetch_pair_by_address(token_addr)
-                    if pair:
-                        all_pairs.append(pair)
-                    time.sleep(0.15)  # small delay between calls
-                logger.info(f"  → Fetched pair data for {len(all_pairs)} boosted tokens")
+                for b in chain_boosted[:15]:
+                    token_addr = b.get("tokenAddress")
+                    if token_addr:
+                        pair = fetch_pair_by_address(token_addr)
+                        if pair:
+                            all_pairs.append(pair)
+                        time.sleep(0.15)
 
-            # === STEP 2: Supplement with keyword search if not enough candidates ===
+            # 2. Keyword fallback
             if len(all_pairs) < 20:
                 logger.debug("Supplementing with keyword search...")
                 seen = set(p.get("pairAddress") for p in all_pairs)
-                for term in SEARCH_TERMS[:8]:  # fewer terms to stay within rate limits
+                for term in SEARCH_TERMS[:8]:
                     pairs = fetch_dex_pairs(term)
                     for p in pairs:
                         addr = p.get("pairAddress")
@@ -360,12 +383,10 @@ def scanner_loop():
                             seen.add(addr)
                             all_pairs.append(p)
                     time.sleep(0.25)
-                logger.debug(f"  → Total unique pairs after keyword search: {len(all_pairs)}")
 
-            # === STEP 3: Filter ===
+            # 3. Filter
             valid_pairs = filter_pairs(all_pairs)
             valid_pairs.sort(key=lambda x: x.get("_m5", 0), reverse=True)
-            # Top 10 unique tokens
             seen_tokens = set()
             top_pairs = []
             for p in valid_pairs:
@@ -377,18 +398,15 @@ def scanner_loop():
                     break
             logger.info(f"Top momentum tokens after filtering: {len(top_pairs)}")
 
-            # === STEP 3.5: Periodic status for open positions ===
+            # 3.5 Periodic status
             if scan_cycle_count % 5 == 0:
                 with trade_lock:
                     open_count = len(active_trades)
-                if open_count > 0:
-                    logger.info(f"📊 STATUS: {open_count} open position(s) — cycle #{scan_cycle_count}")
-                    for addr, t in active_trades.items():
-                        logger.info(f"   • {t['token']}: entry ${t['entry_price']:.8f}, amount ${t['amount_usd']:.2f}")
-                else:
-                    logger.info(f"📊 STATUS: No open positions — cycle #{scan_cycle_count}")
+                logger.info(f"📊 STATUS: {open_count} open position(s) — cycle #{scan_cycle_count}")
+                for addr, t in active_trades.items():
+                    logger.info(f"   • {t['token']}: entry ${t['entry_price']:.8f}, high ${t['highest_price']:.8f}")
 
-            # === STEP 4: Security Checks & Trading ===
+            # 4. Security & Trade
             for pair in top_pairs:
                 token_addr = pair["baseToken"]["address"]
                 security = get_token_security(TARGET_CHAIN_NUMERIC, token_addr)
@@ -397,7 +415,6 @@ def scanner_loop():
                     logger.info(f"Token {pair['baseToken']['symbol']} failed security, skipping")
                     continue
                 if not PAPER_MODE:
-                    logger.info("Paper mode disabled, skipping live trade")
                     continue
                 trade = simulate_buy(pair)
                 if trade:
@@ -417,26 +434,27 @@ def scanner_loop():
                     }
                     send_discord_alert("New paper trade entered", embed)
 
-            # === STEP 5: Monitor Positions ===
+            # 5. Monitor Positions (with trailing & max hold)
             closed_trades = monitor_positions()
             for ct in closed_trades:
                 reason = ct["exit_reason"]
                 emoji = "🟢" if ct["pnl_usd"] >= 0 else "🔴"
                 embed = {
                     "title": f"{emoji} PAPER {reason}: {ct['token']}",
-                    "color": 0x00FF00 if reason == "TAKE_PROFIT" else 0xFF0000,
+                    "color": 0x00FF00 if reason in ("TAKE_PROFIT", "TRAILING_STOP") else 0xFF0000,
                     "fields": [
                         {"name": "Entry", "value": f"${ct['entry_price']:.8f}", "inline": True},
                         {"name": "Exit", "value": f"${ct['exit_price']:.8f}", "inline": True},
                         {"name": "P&L %", "value": f"{ct['pnl_pct']}%", "inline": True},
                         {"name": "P&L $", "value": f"${ct['pnl_usd']:.2f}", "inline": True},
+                        {"name": "Reason", "value": reason, "inline": False},
                         {"name": "DexScreener", "value": f"https://dexscreener.com/{TARGET_CHAIN}/{ct['pair_address']}", "inline": False},
                     ],
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 send_discord_alert(f"Paper {reason.lower()} executed", embed)
 
-            # === STEP 6: Memory Cleanup ===
+            # 6. Memory Cleanup
             if time.time() - last_clean > 600:
                 clean_memory()
                 last_clean = time.time()
@@ -454,35 +472,4 @@ app = Flask(__name__)
 
 @app.route("/")
 def status():
-    with trade_lock:
-        trades_list = []
-        for addr, t in active_trades.items():
-            trades_list.append({
-                "token": t.get("token"),
-                "token_address": t.get("token_address"),
-                "pair_address": t.get("pair_address"),
-                "entry_price": t.get("entry_price"),
-                "amount_usd": t.get("amount_usd"),
-                "quantity": t.get("quantity"),
-                "score": t.get("score"),
-                "timestamp": t.get("timestamp"),
-            })
-    return jsonify({
-        "status": "running",
-        "paper_mode": PAPER_MODE,
-        "target_chain": TARGET_CHAIN,
-        "scan_cycles": scan_cycle_count,
-        "active_trades": len(trades_list),
-        "trades": trades_list,
-    })
-
-
-def run_flask():
-    port = int(os.getenv("PORT", "8080"))
-    logger.info(f"Flask health server starting on port {port}")
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    scanner_loop()
+ 
