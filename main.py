@@ -74,6 +74,9 @@ active_trades: Dict[str, dict] = {}
 recent: Dict[str, float] = {}
 trade_lock = threading.Lock()
 scan_cycle_count = 0
+closed_trades_count = 0
+
+app = Flask(__name__)
 
 # ----------------------------------------------------------------------
 # Discord Alerts
@@ -353,10 +356,12 @@ def monitor_positions_fast() -> List[dict]:
 
 def fast_monitor_loop():
     """Runs in a separate thread — checks positions every 15 seconds."""
+    global closed_trades_count
     logger.info("Fast monitor thread started (15s interval)")
     while True:
         try:
             closed = monitor_positions_fast()
+            closed_trades_count += len(closed)
             for ct in closed:
                 reason = ct["exit_reason"]
                 emoji = "🟢" if ct["pnl_usd"] >= 0 else "🔴"
@@ -488,45 +493,30 @@ def scanner_loop():
                 clean_memory()
                 last_clean = time.time()
 
-            time.sleep(60)
-
+            time.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
-            time.sleep(30)
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
 
 # ----------------------------------------------------------------------
-# Flask Server
+# Flask Health Server
 # ----------------------------------------------------------------------
-app = Flask(__name__)
-
 @app.route("/")
 def status():
-    with trade_lock:
-        trades_list = []
-        for addr, t in active_trades.items():
-            trades_list.append({
-                "token": t.get("token"),
-                "token_address": t.get("token_address"),
-                "pair_address": t.get("pair_address"),
-                "entry_price": t.get("entry_price"),
-                "amount_usd": t.get("amount_usd"),
-                "quantity": t.get("quantity"),
-                "score": t.get("score"),
-                "timestamp": t.get("timestamp"),
-                "highest_price": t.get("highest_price"),
-            })
-    return jsonify({
+    return {
         "status": "running",
+        "version": "v4-fast-monitor",
         "paper_mode": PAPER_MODE,
-        "target_chain": TARGET_CHAIN,
+        "chain": TARGET_CHAIN,
         "scan_cycles": scan_cycle_count,
-        "active_trades": len(trades_list),
-        "trades": trades_list,
-    })
+        "open_positions": len(active_trades),
+        "closed_trades": closed_trades_count,
+    }
 
 
 def run_flask():
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.environ.get("PORT", 8080))
     logger.info(f"Flask health server starting on port {port}")
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
