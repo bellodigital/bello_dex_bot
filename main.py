@@ -28,7 +28,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TARGET_CHAIN = os.getenv("TARGET_CHAIN", "bsc")
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "1.0"))
 
-# Scalping defaults — wider SL to avoid wick-outs
+# Scalping defaults
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-3.0"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
 
@@ -41,7 +41,7 @@ TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "1.0"))
 MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))
 
 # Entry filter: only buy if price has pulled back from 5-min high by this %
-PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0.5"))  # 0 = buy at any price
+PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0.5"))
 
 # Slippage
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
@@ -49,9 +49,12 @@ SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
 # Filters
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000.0"))
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "2.0"))   # raised to 2% to find stronger momentum
+MIN_CHANGE = float(os.getenv("MIN_CHANGE", "2.0"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
 MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "1e-8"))
+
+# Scanning interval (seconds) — add this to fix the NameError
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
 # Chain mapping
 CHAIN_ID_MAP = {
@@ -74,9 +77,6 @@ active_trades: Dict[str, dict] = {}
 recent: Dict[str, float] = {}
 trade_lock = threading.Lock()
 scan_cycle_count = 0
-closed_trades_count = 0
-
-app = Flask(__name__)
 
 # ----------------------------------------------------------------------
 # Discord Alerts
@@ -139,7 +139,6 @@ def fetch_dex_pairs(query: str) -> List[dict]:
         return []
 
 def fetch_pair_price(pair_address: str) -> Optional[float]:
-    """Fast price check for a single pair."""
     url = f"https://api.dexscreener.com/latest/dex/pairs/{TARGET_CHAIN}/{pair_address}"
     try:
         resp = requests.get(url, timeout=5)
@@ -185,25 +184,18 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
     return valid
 
 def is_pullback_entry(pair: dict) -> bool:
-    """
-    Check if current price is below the 5-minute high by at least PULLBACK_ENTRY_PCT.
-    Uses priceChange.m5 to estimate the 5-min high.
-    If m5 is positive, the high is approximately current_price / (1 + m5/100).
-    We buy only if current price <= high * (1 - PULLBACK_ENTRY_PCT/100).
-    """
     if PULLBACK_ENTRY_PCT <= 0:
-        return True  # filter disabled
+        return True
     try:
         price = pair.get("_price", float(pair.get("priceUsd", 0)))
         m5 = pair.get("_m5", 0)
         if m5 <= 0:
-            return False  # no positive momentum, skip
-        # Estimate 5-min high: if price rose m5%, then high = price / (1 + m5/100)
+            return False
         estimated_high = price / (1 + m5 / 100)
         pullback_target = estimated_high * (1 - PULLBACK_ENTRY_PCT / 100)
         return price <= pullback_target
     except:
-        return True  # on error, allow entry
+        return True
 
 # ----------------------------------------------------------------------
 # Security
@@ -290,7 +282,6 @@ def simulate_buy(pair: dict) -> Optional[dict]:
 # Fast Monitoring (runs in separate thread every 15 seconds)
 # ----------------------------------------------------------------------
 def monitor_positions_fast() -> List[dict]:
-    """Check all open trades. Called every 15 seconds."""
     closed = []
     now = time.time()
 
@@ -306,22 +297,18 @@ def monitor_positions_fast() -> List[dict]:
             entry_price = trade["entry_price"]
             pct_change = ((current_price - entry_price) / entry_price) * 100
 
-            # Update highest price
             with trade_lock:
                 if token_addr in active_trades:
                     if current_price > active_trades[token_addr]["highest_price"]:
                         active_trades[token_addr]["highest_price"] = current_price
 
-            # Exit conditions
             exit_reason = None
 
-            # Fixed TP/SL
             if pct_change >= TAKE_PROFIT_PCT:
                 exit_reason = "TAKE_PROFIT"
             elif pct_change <= STOP_LOSS_PCT:
                 exit_reason = "STOP_LOSS"
 
-            # Trailing stop
             if exit_reason is None and TRAILING_STOP_ENABLED:
                 highest = trade.get("highest_price", entry_price)
                 profit_from_high = ((highest - entry_price) / entry_price) * 100
@@ -330,7 +317,6 @@ def monitor_positions_fast() -> List[dict]:
                     if current_price <= trailing_stop_price:
                         exit_reason = "TRAILING_STOP"
 
-            # Max hold time
             if exit_reason is None and MAX_HOLD_MINUTES > 0:
                 age_min = (now - trade.get("timestamp", now)) / 60
                 if age_min >= MAX_HOLD_MINUTES:
@@ -355,13 +341,10 @@ def monitor_positions_fast() -> List[dict]:
     return closed
 
 def fast_monitor_loop():
-    """Runs in a separate thread — checks positions every 15 seconds."""
-    global closed_trades_count
     logger.info("Fast monitor thread started (15s interval)")
     while True:
         try:
             closed = monitor_positions_fast()
-            closed_trades_count += len(closed)
             for ct in closed:
                 reason = ct["exit_reason"]
                 emoji = "🟢" if ct["pnl_usd"] >= 0 else "🔴"
@@ -381,7 +364,7 @@ def fast_monitor_loop():
                 send_discord_alert(f"Paper {reason.lower()} executed", embed)
         except Exception as e:
             logger.error(f"Fast monitor loop error: {e}")
-        time.sleep(15)  # check every 15 seconds
+        time.sleep(15)
 
 # ----------------------------------------------------------------------
 # Memory Cleanup
@@ -406,7 +389,7 @@ def scanner_loop():
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
     logger.info(f"Trailing: {TRAILING_STOP_ENABLED} (activate at +{TRAILING_ACTIVATION_PCT}%, distance {TRAILING_DISTANCE_PCT}%)")
     logger.info(f"Pullback Entry: {PULLBACK_ENTRY_PCT}% below 5-min high")
-    logger.info(f"Slippage: {SLIPPAGE_PCT}%, Max Hold: {MAX_HOLD_MINUTES} min")
+    logger.info(f"Slippage: {SLIPPAGE_PCT}%, Max Hold: {MAX_HOLD_MINUTES} min, Scan Interval: {SCAN_INTERVAL_SECONDS}s")
     logger.info("=" * 50)
 
     last_clean = time.time()
@@ -442,7 +425,6 @@ def scanner_loop():
 
             # 3. Filter + pullback check
             valid_pairs = filter_pairs(all_pairs)
-            # Apply pullback entry filter
             if PULLBACK_ENTRY_PCT > 0:
                 before = len(valid_pairs)
                 valid_pairs = [p for p in valid_pairs if is_pullback_entry(p)]
@@ -488,40 +470,22 @@ def scanner_loop():
                     send_discord_alert("New paper trade entered", embed)
 
             # 5. Memory Cleanup
-            #    (Position monitoring runs in its own thread — see fast_monitor_loop)
             if time.time() - last_clean > 600:
                 clean_memory()
                 last_clean = time.time()
 
+            # 6. Status log
+            if scan_cycle_count % 5 == 0:
+                with trade_lock:
+                    open_count = len(active_trades)
+                logger.info(f"📊 STATUS: {open_count} open position(s) — cycle #{scan_cycle_count}")
+
+            # 7. Sleep exactly the configured interval
             time.sleep(SCAN_INTERVAL_SECONDS)
+
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
-            time.sleep(SCAN_INTERVAL_SECONDS)
-
+            time.sleep(30)
 
 # ----------------------------------------------------------------------
-# Flask Health Server
-# ----------------------------------------------------------------------
-@app.route("/")
-def status():
-    return {
-        "status": "running",
-        "version": "v4-fast-monitor",
-        "paper_mode": PAPER_MODE,
-        "chain": TARGET_CHAIN,
-        "scan_cycles": scan_cycle_count,
-        "open_positions": len(active_trades),
-        "closed_trades": closed_trades_count,
-    }
-
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Flask health server starting on port {port}")
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=fast_monitor_loop, daemon=True).start()
-    scanner_loop()
+# Flask Server
