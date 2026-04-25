@@ -472,4 +472,37 @@ app = Flask(__name__)
 
 @app.route("/")
 def status():
+    with trade_lock:
+        trades_list = []
+        for addr, t in active_trades.items():
+            trades_list.append({
+                "token": t.get("token"),
+                "token_address": t.get("token_address"),
+                "pair_address": t.get("pair_address"),
+                "entry_price": t.get("entry_price"),
+                "amount_usd": t.get("amount_usd"),
+                "quantity": t.get("quantity"),
+                "score": t.get("score"),
+                "timestamp": t.get("timestamp"),
+                "highest_price": t.get("highest_price"),
+            })
+    return jsonify({
+        "status": "running",
+        "paper_mode": PAPER_MODE,
+        "target_chain": TARGET_CHAIN,
+        "scan_cycles": scan_cycle_count,
+        "active_trades": len(trades_list),
+        "trades": trades_list,
+    })
+
+
+def run_flask():
+    port = int(os.getenv("PORT", "8080"))
+    logger.info(f"Flask health server starting on port {port}")
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    scanner_loop()
  
